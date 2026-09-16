@@ -1,0 +1,3732 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import '../../styles/global.css';
+import TelegramSettingsModal from '../../components/dashboard/TelegramSettingsModal';
+import UserJourneyTimeline from '../../components/dashboard/UserJourneyTimeline';
+import SystemHealthSummary from '../../components/dashboard/SystemHealthSummary';
+import IssueManagementPanel from '../../components/dashboard/IssueManagementPanel';
+import { exportToCsv } from '../../utils/exportCsv';
+import { usePlatform } from '../../context/PlatformContext';
+
+const API_MONITOR_URL = import.meta.env.VITE_WORKER_URL || 'https://flow-api.hieupham101097.workers.dev';
+
+// Nhận diện dữ liệu thuộc Web hay Mobile App
+function isItemWeb(item) {
+  if (!item) return false;
+  if (item.job_type === 'web') return true;
+  if (item.job_type === 'app') return false;
+
+  const dev = String(item.device_name || item.device_info || '').toLowerCase();
+  const app = String(item.app_identifier || '').toLowerCase();
+  const ep = String(item.endpoint || '').toLowerCase();
+  if (
+    dev.includes('chrome') ||
+    dev.includes('safari') ||
+    dev.includes('firefox') ||
+    dev.includes('edge') ||
+    dev.includes('browser') ||
+    dev.includes('trình duyệt') ||
+    dev.includes('windows') ||
+    dev.includes('macos') ||
+    app.includes('web') ||
+    app.includes('portal') ||
+    ep.includes('myportal')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// Phân biệt tên thiết bị thuộc Trình duyệt Web hay Điện thoại di động
+function isDeviceWeb(deviceName) {
+  if (!deviceName) return false;
+  const dev = String(deviceName).toLowerCase();
+  return (
+    dev.includes('chrome') ||
+    dev.includes('safari') ||
+    dev.includes('firefox') ||
+    dev.includes('edge') ||
+    dev.includes('browser') ||
+    dev.includes('trình duyệt') ||
+    dev.includes('windows') ||
+    dev.includes('macos') ||
+    dev.includes('linux') ||
+    dev.includes('opera') ||
+    dev.includes('web')
+  );
+}
+
+// Màu của từng nhóm kết quả, dùng chung cho cột chồng, chú giải và biểu đồ ngày
+const OUTCOME_COLORS = {
+  success_auto: 'var(--success)',
+  success_manual: 'var(--accent)',
+  failed: 'var(--danger)',
+  abandoned: 'var(--warning)',
+  open: 'var(--text-dim)',
+  other: 'var(--line-strong)',
+};
+
+const RANGE_OPTIONS = [
+  { value: 1, label: 'Hôm nay' },
+  { value: 7, label: '7 ngày qua' },
+  { value: 30, label: '30 ngày qua' },
+  { value: 90, label: '90 ngày qua' },
+];
+
+// Số dòng telemetry tối đa giữ trong bộ nhớ khi polling ghép dần
+const TELEMETRY_CAP = 300;
+
+const formatMs = (value) => {
+  if (value === null || value === undefined) return '—';
+  const ms = Number(value);
+  return ms >= 1000 ? `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s` : `${ms}ms`;
+};
+
+// Chuẩn hóa timestamp SQLite UTC sang Date object
+function parseUtcDate(dateStr) {
+  if (!dateStr) return null;
+  // SQLite trả về: "YYYY-MM-DD HH:MM:SS" (không có T và Z)
+  // Chuẩn hóa thành ISO 8601 UTC để mọi trình duyệt hiểu đúng múi giờ UTC
+  const cleanStr = String(dateStr).trim();
+  const isoStr = cleanStr.includes('T')
+    ? (cleanStr.endsWith('Z') ? cleanStr : `${cleanStr}Z`)
+    : `${cleanStr.replace(' ', 'T')}Z`;
+  const d = new Date(isoStr);
+  return isNaN(d.getTime()) ? new Date(dateStr) : d;
+}
+
+// Luôn hiển thị chính xác theo Giờ Việt Nam (Asia/Ho_Chi_Minh - GMT+7), 24h
+function formatVietnamTime(dateStr) {
+  const d = parseUtcDate(dateStr);
+  if (!d || isNaN(d.getTime())) return '—';
+  return d.toLocaleTimeString('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    hour12: false,
+  });
+}
+
+function formatVietnamDate(dateStr) {
+  const d = parseUtcDate(dateStr);
+  if (!d || isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+  });
+}
+
+function formatVietnamDateTime(dateStr) {
+  const d = parseUtcDate(dateStr);
+  if (!d || isNaN(d.getTime())) return '—';
+  return `${d.toLocaleTimeString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh', hour12: false })} - ${d.toLocaleDateString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}`;
+}
+
+// Dropdown tuỳ chỉnh chạy thuần DOM - không tạo Win32 HWND popup riêng của Windows,
+// giải quyết triệt để lỗi dropdown không mở / không tương tác được trên WinForms WebView
+function CustomSelect({
+  value,
+  onChange,
+  options = [],
+  className = '',
+  ariaLabel = '',
+  placeholder = 'Chọn...',
+  alignRight = false,
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (containerRef.current && !containerRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    }
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') setIsOpen(false);
+    }
+    if (isOpen) {
+      // Dùng pointerdown thay cho mousedown để tương thích tối đa với WinForms WebView2
+      document.addEventListener('pointerdown', handleClickOutside);
+      document.addEventListener('keydown', handleKeyDown);
+    }
+    return () => {
+      document.removeEventListener('pointerdown', handleClickOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isOpen]);
+
+  const selectedOption = options.find((opt) => String(opt.value) === String(value)) || options[0];
+
+  return (
+    <div className={`custom-select-container ${className}`} ref={containerRef}>
+      <button
+        type="button"
+        className="custom-select-trigger"
+        onClick={(e) => {
+          e.stopPropagation();
+          setIsOpen((prev) => !prev);
+        }}
+        aria-expanded={isOpen}
+        aria-label={ariaLabel}
+      >
+        <span className="custom-select-label">
+          {selectedOption ? selectedOption.label : placeholder}
+        </span>
+        <span className={`custom-select-arrow ${isOpen ? 'open' : ''}`}>▾</span>
+      </button>
+
+      {isOpen && (
+        <div className={`custom-select-menu ${alignRight ? 'align-right' : ''}`} role="listbox">
+          {options.length === 0 ? (
+            <div style={{ padding: '0.45rem 0.65rem', color: 'var(--text-muted)', fontSize: '0.78rem' }}>
+              Không có lựa chọn
+            </div>
+          ) : (
+            options.map((opt) => {
+              const isSelected = String(opt.value) === String(value);
+              return (
+                <button
+                  key={String(opt.value)}
+                  type="button"
+                  role="option"
+                  aria-selected={isSelected}
+                  className={`custom-select-option ${isSelected ? 'selected' : ''}`}
+                  onMouseDown={(e) => {
+                    // Xử lý trực tiếp trên MouseDown để ngăn chặn race-condition với document click
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onChange(opt.value);
+                    setIsOpen(false);
+                  }}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onChange(opt.value);
+                    setIsOpen(false);
+                  }}
+                >
+                  {opt.label}
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CodeBlock({ label, value, copyKey, copiedItem, onCopy }) {
+  return (
+    <div className="code-block">
+      <div className="code-caption">
+        <span>{label}</span>
+        <button type="button" onClick={() => onCopy(value, copyKey)}>
+          {copiedItem === copyKey ? '✓ Đã chép' : 'Sao chép'}
+        </button>
+      </div>
+      <pre><code>{value}</code></pre>
+    </div>
+  );
+}
+
+// Kiểm tra 2 danh sách telemetry có thay đổi thực sự không trước khi re-render
+function hasTelemetryArrayChanged(prev, next) {
+  if (!Array.isArray(next)) return false;
+  if (!Array.isArray(prev) || prev.length !== next.length) return true;
+  if (next.length === 0) return false;
+  // So sánh phần tử đầu tiên (mới nhất) và ID để tránh render thừa
+  return prev[0]?.id !== next[0]?.id || prev[0]?.created_at !== next[0]?.created_at;
+}
+
+// Chuẩn hoá mọi giá trị về chuỗi thường trước khi so khớp tìm kiếm.
+// D1 có thể trả về số (hoặc null) cho các cột khai báo TEXT — gọi thẳng
+// .toLowerCase() trên các giá trị đó sẽ ném TypeError và làm chết ô tìm kiếm.
+function toSearchText(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.toLowerCase();
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value).toLowerCase();
+    } catch {
+      return '';
+    }
+  }
+  return String(value).toLowerCase();
+}
+
+// Component phân trang tối ưu bộ nhớ DOM cho WebView
+function PaginationDock({ currentPage, totalItems, pageSize, onPageChange, onPageSizeChange }) {
+  const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+  const startItem = totalItems === 0 ? 0 : (currentPage - 1) * pageSize + 1;
+  const endItem = Math.min(totalItems, currentPage * pageSize);
+
+  if (totalItems <= 0) return null;
+
+  return (
+    <div className="pagination-dock">
+      <div className="pagination-info">
+        <span>Hiển thị <strong>{startItem} - {endItem}</strong> / <strong>{totalItems}</strong> mục</span>
+        <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.45rem', marginLeft: '0.65rem' }}>
+          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Mỗi trang:</span>
+          <CustomSelect
+            className="select-pagination"
+            value={pageSize}
+            onChange={(val) => onPageSizeChange(Number(val))}
+            options={[
+              { value: 10, label: '10' },
+              { value: 20, label: '20' },
+              { value: 50, label: '50' },
+              { value: 100, label: '100' },
+            ]}
+            ariaLabel="Số dòng mỗi trang"
+          />
+        </div>
+      </div>
+
+      <div className="pagination-nav">
+        <button
+          type="button"
+          className="pagination-btn"
+          disabled={currentPage <= 1}
+          onClick={() => onPageChange(1)}
+          title="Trang đầu"
+        >
+          «
+        </button>
+        <button
+          type="button"
+          className="pagination-btn"
+          disabled={currentPage <= 1}
+          onClick={() => onPageChange(currentPage - 1)}
+          title="Trang trước"
+        >
+          ‹
+        </button>
+
+        <span style={{ margin: '0 0.5rem', fontWeight: 600, fontSize: '0.82rem' }}>
+          {currentPage} / {totalPages}
+        </span>
+
+        <button
+          type="button"
+          className="pagination-btn"
+          disabled={currentPage >= totalPages}
+          onClick={() => onPageChange(currentPage + 1)}
+          title="Trang tiếp"
+        >
+          ›
+        </button>
+        <button
+          type="button"
+          className="pagination-btn"
+          disabled={currentPage >= totalPages}
+          onClick={() => onPageChange(totalPages)}
+          title="Trang cuối"
+        >
+          »
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Dashboard() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const userIdFromUrl = searchParams.get('user_id');
+
+  // Multi-telemetry Mode: 'issues' | 'logs' | 'crashes' | 'analytics' | 'funnels' | 'timeline'
+  const [telemetryMode, setTelemetryMode] = useState('logs');
+
+  // Issue APM unresolved count
+  const [unresolvedIssuesCount, setUnresolvedIssuesCount] = useState(0);
+
+  // Data states
+  const [logs, setLogs] = useState([]);
+  const [crashes, setCrashes] = useState([]);
+  const [events, setEvents] = useState([]);
+
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [quotaExceeded, setQuotaExceeded] = useState(false);
+
+  // Sub-filter Tabs
+  const [activeTab, setActiveTab] = useState('all'); // for logs: 'all', '200', '400', '500'
+  const [crashTab, setCrashTab] = useState('all');   // for crashes: 'all', 'fatal', 'non-fatal'
+  const [eventTab, setEventTab] = useState('all');   // for analytics: 'all', 'custom', 'screen_view'
+
+  const [searchTerm, setSearchTerm] = useState('');
+
+  // Pagination states (Mặc định 20 dòng để Mobile WebView mượt tuyệt đối)
+  const [logsPage, setLogsPage] = useState(1);
+  const [logsPageSize, setLogsPageSize] = useState(20);
+
+  const [crashPage, setCrashPage] = useState(1);
+  const [crashPageSize, setCrashPageSize] = useState(20);
+
+  const [eventPage, setEventPage] = useState(1);
+  const [eventPageSize, setEventPageSize] = useState(20);
+
+  // Auto-refresh control (Mặc định 15s để không chiếm dụng CPU WebView)
+  const [refreshInterval, setRefreshInterval] = useState(30000);
+
+  // Modals
+  const [selectedLog, setSelectedLog] = useState(null);
+  const [selectedCrash, setSelectedCrash] = useState(null);
+  const [selectedEvent, setSelectedEvent] = useState(null);
+
+  const { platformScope, openPlatformModal } = usePlatform();
+  const [copiedItem, setCopiedItem] = useState(null);
+  const [integrationOpen, setIntegrationOpen] = useState(false);
+  const [setupTab, setSetupTab] = useState(platformScope === 'web' ? 'angular' : 'crashlytics');
+
+  useEffect(() => {
+    setSetupTab(platformScope === 'web' ? 'angular' : 'crashlytics');
+  }, [platformScope]);
+
+  // User & Job Filtering State
+  const [filterMeta, setFilterMeta] = useState({ apps: [], devices: [], users: [] });
+  const [usersList, setUsersList] = useState([]);
+  const [selectedFilter, setSelectedFilter] = useState(userIdFromUrl || 'all');
+  const [deviceFilter, setDeviceFilter] = useState('all');
+  const [userFilter, setUserFilter] = useState('all');
+
+  const isFetchingUsersRef = useRef(false);
+  const isFetchingMetaRef = useRef(false);
+
+  // Thống kê sự kiện (funnel): danh sách cấu hình, funnel đang xem và số liệu đã tổng hợp
+  const [funnels, setFunnels] = useState([]);
+  const [activeFunnel, setActiveFunnel] = useState('ekyb');
+  const [statsRange, setStatsRange] = useState(7);
+  const [funnelStats, setFunnelStats] = useState(null);
+  const [statsLoading, setStatsLoading] = useState(false);
+  const [statsError, setStatsError] = useState(null);
+  const [funnelSetupOpen, setFunnelSetupOpen] = useState(false);
+  const [eventCatalog, setEventCatalog] = useState({ events: [], suggestions: [] });
+  const [funnelDraft, setFunnelDraft] = useState({ funnel_key: '', name: '', event_prefix: '', app_identifier: '' });
+  const [savingFunnel, setSavingFunnel] = useState(false);
+
+  // Telegram Alerting & User Journey Timeline states
+  const [telegramModalOpen, setTelegramModalOpen] = useState(false);
+  const [timelineUser, setTimelineUser] = useState('');
+  const [timelineDevice, setTimelineDevice] = useState('');
+  const [timelineApp, setTimelineApp] = useState('');
+
+  const viewUserTimeline = ({ user = '', device = '', app = '' }) => {
+    setTimelineUser(user);
+    setTimelineDevice(device);
+    setTimelineApp(app);
+    setTelemetryMode('timeline');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const copyToClipboard = async (value, item) => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedItem(item);
+      window.setTimeout(() => {
+        setCopiedItem((current) => current === item ? null : current);
+      }, 1600);
+    } catch {
+      setCopiedItem(null);
+    }
+  };
+
+  const fetchUsers = async () => {
+    if (isFetchingUsersRef.current) return;
+    isFetchingUsersRef.current = true;
+    try {
+      const response = await fetch(`${API_MONITOR_URL}/users`, {
+        headers: { Accept: 'application/json' },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (Array.isArray(data)) {
+          setUsersList(data);
+        }
+      }
+    } catch (err) {
+      console.warn('Lỗi tải /users, chuyển sang tự nhận diện từ telemetry:', err);
+    } finally {
+      isFetchingUsersRef.current = false;
+    }
+  };
+
+  // Danh sách chỉ tải bản rút gọn (payload cắt 300 ký tự, không có request_payload
+  // và stack trace đầy đủ) để giảm dữ liệu đọc. Bản đầy đủ chỉ lấy khi mở chi tiết.
+  const openDetail = async (type, row, setter) => {
+    setter(row);
+    if (!row?.id) return;
+    try {
+      const response = await fetch(
+        `${API_MONITOR_URL}/telemetry/detail?type=${type}&id=${encodeURIComponent(row.id)}`,
+        { cache: 'no-store', headers: { Accept: 'application/json' } }
+      );
+      if (!response.ok) return;
+      const full = await response.json();
+      if (!full || !full.id) return;
+      // Người dùng có thể đã đóng hoặc mở bản ghi khác trong lúc chờ
+      setter((current) => (current && current.id === full.id ? { ...current, ...full } : current));
+    } catch (err) {
+      console.warn('Không tải được bản đầy đủ, giữ bản rút gọn:', err);
+    }
+  };
+
+  const fetchFilterMetadata = async (scope = platformScope) => {
+    if (isFetchingMetaRef.current) return;
+    isFetchingMetaRef.current = true;
+    try {
+      const response = await fetch(`${API_MONITOR_URL}/telemetry/filters?platform=${encodeURIComponent(scope || 'all')}`, {
+        headers: { Accept: 'application/json' },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data && data.quota_exceeded) {
+          setQuotaExceeded(true);
+        }
+        if (data && typeof data === 'object') {
+          setFilterMeta({
+            apps: Array.isArray(data.apps) ? data.apps : [],
+            devices: Array.isArray(data.devices) ? data.devices : [],
+            users: Array.isArray(data.users) ? data.users : [],
+          });
+        }
+      } else {
+        const errText = await response.text().catch(() => '');
+        if (errText.includes('daily row read limit') || errText.includes('exceeded D1') || errText.includes('D1_ERROR')) {
+          setQuotaExceeded(true);
+        }
+      }
+    } catch (err) {
+      console.warn('Lỗi tải /telemetry/filters:', err);
+    } finally {
+      isFetchingMetaRef.current = false;
+    }
+  };
+
+  // Interval polling cần đọc danh sách hiện tại để biết id lớn nhất. Nếu đưa
+  // logs/crashes/events vào dependency của useEffect thì timer bị dựng lại sau
+  // mỗi lần dữ liệu đổi, nên giữ qua ref.
+  const telemetryRef = useRef({ logs: [], crashes: [], events: [] });
+  useEffect(() => {
+    telemetryRef.current = { logs, crashes, events };
+  }, [logs, crashes, events]);
+
+  // Ghép các dòng mới lấy về vào đầu danh sách đang giữ, cắt bớt phần đuôi.
+  // Dùng cho chế độ polling tăng dần: server chỉ trả về dòng mới hơn id đang có.
+  const mergeIncoming = (previous, incoming, cap) => {
+    if (!incoming.length) return previous;
+    const seen = new Set(incoming.map((row) => row.id));
+    return [...incoming, ...previous.filter((row) => !seen.has(row.id))].slice(0, cap);
+  };
+
+  const fetchAllTelemetry = async (overrideFilter, overrideDevice, overrideUser, options = {}) => {
+    const incremental = options.incremental === true;
+    try {
+      // Đảm bảo usersList và filter metadata luôn được nạp lại nếu trước đó WebView kết nối trễ
+      if (usersList.length === 0 && !isFetchingUsersRef.current) {
+        fetchUsers();
+      }
+      if ((!filterMeta.apps || filterMeta.apps.length === 0) && !isFetchingMetaRef.current) {
+        fetchFilterMetadata(platformScope);
+      }
+
+      const activeUser = overrideFilter !== undefined ? overrideFilter : selectedFilter;
+      const activeDevice = overrideDevice !== undefined ? overrideDevice : deviceFilter;
+      const activeUserName = overrideUser !== undefined ? overrideUser : userFilter;
+
+      const queryParts = [];
+
+      // Bắt buộc luôn truyền platform xuống API để server lọc từ gốc
+      if (platformScope) {
+        queryParts.push(`platform=${encodeURIComponent(platformScope)}`);
+      }
+
+      if (activeUser && activeUser !== 'all') {
+        if (!isNaN(Number(activeUser))) {
+          queryParts.push(`user_id=${encodeURIComponent(activeUser)}`);
+        } else {
+          queryParts.push(`app_identifier=${encodeURIComponent(activeUser)}`);
+        }
+      }
+      if (activeDevice && activeDevice !== 'all') {
+        queryParts.push(`device=${encodeURIComponent(activeDevice)}`);
+      }
+      if (activeUserName && activeUserName !== 'all') {
+        queryParts.push(`user=${encodeURIComponent(activeUserName)}`);
+      }
+
+      // Polling tăng dần: chỉ hỏi những dòng mới hơn dòng đang giữ. Một dashboard
+      // mở cả ngày mà app không sinh telemetry sẽ đọc 0 dòng thay vì kéo lại toàn
+      // bộ danh sách sau mỗi chu kỳ — đây là nguồn đốt hạn mức đọc D1 lớn nhất.
+      const withCursor = (base, rows) => {
+        const parts = [...queryParts];
+        if (incremental && rows.length > 0) {
+          const maxId = rows.reduce((max, row) => (row.id > max ? row.id : max), 0);
+          if (maxId > 0) parts.push(`after_id=${maxId}`);
+        }
+        return parts.length ? `${base}?${parts.join('&')}` : base;
+      };
+
+      const held = telemetryRef.current;
+      // Không đặt cache:'no-store' nữa để header Cache-Control của worker còn tác dụng
+      const fetchOptions = { headers: { Accept: 'application/json' } };
+      const [logsRes, crashesRes, eventsRes] = await Promise.all([
+        fetch(`${API_MONITOR_URL}${withCursor('/logs', held.logs)}`, fetchOptions),
+        fetch(`${API_MONITOR_URL}${withCursor('/crashes', held.crashes)}`, fetchOptions),
+        fetch(`${API_MONITOR_URL}${withCursor('/events', held.events)}`, fetchOptions),
+      ]);
+
+      const applyResult = async (response, setter, current) => {
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          if (
+            text.includes('daily row read limit') ||
+            text.includes('exceeded D1') ||
+            text.includes('D1_ERROR')
+          ) {
+            setQuotaExceeded(true);
+          }
+          return;
+        }
+        const data = await response.json();
+        if (!Array.isArray(data)) return;
+        if (incremental && current.length > 0) {
+          setter((prev) => mergeIncoming(prev, data, TELEMETRY_CAP));
+        } else {
+          setter((prev) => (hasTelemetryArrayChanged(prev, data) ? data : prev));
+        }
+      };
+
+      await applyResult(logsRes, setLogs, held.logs);
+      await applyResult(crashesRes, setCrashes, held.crashes);
+      await applyResult(eventsRes, setEvents, held.events);
+
+      // Cập nhật số lượng sự cố chưa giải quyết cho Tab badge
+      try {
+        const issueUrl = `${API_MONITOR_URL}/issues?limit=1&status=unresolved&platform=${encodeURIComponent(platformScope || 'all')}${
+          activeUser && activeUser !== 'all' ? `&app_identifier=${encodeURIComponent(activeUser)}` : ''
+        }`;
+        const issueRes = await fetch(issueUrl, fetchOptions);
+        if (issueRes.ok) {
+          const issueData = await issueRes.json();
+          if (issueData?.counts?.unresolved !== undefined) {
+            setUnresolvedIssuesCount(issueData.counts.unresolved);
+          }
+        }
+      } catch {
+        // silent
+      }
+
+      setError(null);
+    } catch (requestError) {
+      if (requestError.message?.includes('daily row read limit') || requestError.message?.includes('exceeded D1')) {
+        setQuotaExceeded(true);
+      }
+      setError(requestError.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchUsers();
+    fetchFilterMetadata();
+  }, []);
+
+  // Update when URL params change
+  useEffect(() => {
+    if (userIdFromUrl) {
+      setSelectedFilter(userIdFromUrl);
+      fetchAllTelemetry(userIdFromUrl);
+    } else {
+      fetchAllTelemetry(selectedFilter);
+    }
+  }, [userIdFromUrl]);
+
+  // Polling thông minh: Chỉ chạy khi tab/webview hiển thị, không bị vượt quota và người dùng bật auto-refresh
+  useEffect(() => {
+    if (!refreshInterval || refreshInterval <= 0 || quotaExceeded) return undefined;
+
+    const interval = window.setInterval(() => {
+      // Nếu WebView bị ẩn nền (tab ẩn, khóa màn hình), không kéo dữ liệu thừa
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        return;
+      }
+      fetchAllTelemetry(undefined, undefined, undefined, { incremental: true });
+      if (telemetryMode === 'funnels') fetchFunnelStats();
+    }, refreshInterval);
+
+    return () => window.clearInterval(interval);
+  }, [selectedFilter, deviceFilter, userFilter, refreshInterval, telemetryMode]);
+
+  const handleFilterChange = (val) => {
+    setSelectedFilter(val);
+    if (val === 'all') {
+      setSearchParams({});
+      fetchAllTelemetry('all', deviceFilter, userFilter);
+    } else {
+      setSearchParams({ user_id: val });
+      fetchAllTelemetry(val, deviceFilter, userFilter);
+    }
+  };
+
+  const handleDeviceChange = (val) => {
+    setDeviceFilter(val);
+    fetchAllTelemetry(selectedFilter, val, userFilter);
+  };
+
+  const handleUserChange = (val) => {
+    setUserFilter(val);
+    fetchAllTelemetry(selectedFilter, deviceFilter, val);
+  };
+
+  // WinForms WebView2 Interop Bridge
+  useEffect(() => {
+    window.flowApi = {
+      setFilter: (val) => handleFilterChange(val),
+      setDevice: (d) => handleDeviceChange(d),
+      setUser: (u) => handleUserChange(u),
+      refresh: () => fetchAllTelemetry(),
+      getFilterState: () => ({
+        selectedFilter,
+        deviceFilter,
+        userFilter,
+        telemetryMode,
+      }),
+    };
+
+    const handleWebViewMessage = (event) => {
+      try {
+        const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
+        if (!data || typeof data !== 'object') return;
+
+        if (data.action === 'setFilter' && data.value !== undefined) {
+          handleFilterChange(data.value);
+        } else if (data.action === 'setDevice' && data.value !== undefined) {
+          handleDeviceChange(data.value);
+        } else if (data.action === 'setUser' && data.value !== undefined) {
+          handleUserChange(data.value);
+        } else if (data.action === 'refresh') {
+          fetchAllTelemetry();
+        }
+      } catch (err) {
+        console.warn('WinForms message parse error:', err);
+      }
+    };
+
+    if (typeof window !== 'undefined' && window.chrome && window.chrome.webview) {
+      window.chrome.webview.addEventListener('message', handleWebViewMessage);
+      try {
+        window.chrome.webview.postMessage({ type: 'FLOW_API_READY' });
+      } catch (_) {}
+    }
+
+    return () => {
+      if (typeof window !== 'undefined' && window.chrome && window.chrome.webview) {
+        window.chrome.webview.removeEventListener('message', handleWebViewMessage);
+      }
+      delete window.flowApi;
+    };
+  }, [selectedFilter, deviceFilter, userFilter, telemetryMode]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.chrome && window.chrome.webview) {
+      try {
+        window.chrome.webview.postMessage({
+          type: 'FILTER_CHANGED',
+          selectedFilter,
+          deviceFilter,
+          userFilter,
+          telemetryMode,
+        });
+      } catch (_) {}
+    }
+  }, [selectedFilter, deviceFilter, userFilter, telemetryMode]);
+
+  // Reset trang về 1 khi đổi bộ lọc hoặc từ khóa tìm kiếm
+  useEffect(() => {
+    setLogsPage(1);
+  }, [activeTab, searchTerm, selectedFilter, deviceFilter, userFilter]);
+
+  useEffect(() => {
+    setCrashPage(1);
+  }, [crashTab, searchTerm, selectedFilter, deviceFilter, userFilter]);
+
+  useEffect(() => {
+    setEventPage(1);
+  }, [eventTab, searchTerm, selectedFilter, deviceFilter, userFilter]);
+
+  // Escape to close any open modal
+  useEffect(() => {
+    if (!selectedLog && !selectedCrash && !selectedEvent) return undefined;
+
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') {
+        setSelectedLog(null);
+        setSelectedCrash(null);
+        setSelectedEvent(null);
+      }
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', closeOnEscape);
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [selectedLog, selectedCrash, selectedEvent]);
+
+  // Danh sách App / Job khả dụng để lọc - tự động kết hợp từ /telemetry/filters VÀ từ /users API VÀ telemetry
+  // Giúp dropdown KHÔNG BAO GIỜ bị rỗng kể cả khi chạy webview WinForms bị nghẽn mạng ban đầu!
+  const availableJobs = useMemo(() => {
+    const list = [];
+    const seen = new Set();
+
+    // 1. Nạp từ metadata API /telemetry/filters
+    if (Array.isArray(filterMeta.apps) && filterMeta.apps.length > 0) {
+      filterMeta.apps.forEach((app) => {
+        const key = app.app_identifier || app.id;
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          list.push({
+            id: String(app.id),
+            filterValue: String(app.filterValue || app.id),
+            job_name: app.job_name || app.name,
+            app_identifier: app.app_identifier || '',
+            job_type: app.job_type || (isItemWeb(app) ? 'web' : 'app'),
+            name: app.user_name || app.name || 'Hệ thống',
+          });
+        }
+      });
+    }
+
+    // 2. Dự phòng thêm từ /users API
+    if (Array.isArray(usersList)) {
+      usersList.forEach((u) => {
+        if (u && (u.job_name || u.app_identifier)) {
+          const key = u.app_identifier || `user_${u.id}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            list.push({
+              id: String(u.id),
+              filterValue: String(u.id),
+              job_name: u.job_name || u.name,
+              app_identifier: u.app_identifier || '',
+              job_type: u.job_type || 'app',
+              name: u.name,
+            });
+          }
+        }
+      });
+    }
+
+    // 3. Dự phòng thêm khi usersList chưa tải xong hoặc mạng WebView bị nghẽn
+    const scanItems = [...logs, ...crashes, ...events];
+    scanItems.forEach((item) => {
+      const appId = item.app_identifier;
+      if (appId && !seen.has(appId)) {
+        seen.add(appId);
+        list.push({
+          id: appId,
+          filterValue: item.job_id ? String(item.job_id) : appId,
+          job_name: item.job_name || appId,
+          app_identifier: appId,
+          job_type: item.job_type || (isItemWeb(item) ? 'web' : 'app'),
+          name: item.user_name || 'Telemetry App',
+        });
+      }
+    });
+
+    if (platformScope === 'web') {
+      return list.filter((item) => item.job_type === 'web');
+    }
+    if (platformScope === 'app') {
+      return list.filter((item) => item.job_type === 'app');
+    }
+    return list;
+  }, [filterMeta.apps, usersList, logs, crashes, events, platformScope]);
+
+  const activeUserJob = useMemo(() => {
+    if (!selectedFilter || selectedFilter === 'all') return null;
+    return availableJobs.find(
+      (u) => String(u.id) === String(selectedFilter) || 
+             String(u.filterValue) === String(selectedFilter) ||
+             String(u.app_identifier) === String(selectedFilter)
+    ) || null;
+  }, [selectedFilter, availableJobs]);
+
+  const currentAppId = activeUserJob?.app_identifier || (platformScope === 'web' ? 'vn.myportal.web' : 'vn.fizahub.app');
+
+  // Tự động chuyển bộ lọc về 'all' nếu job đang chọn không thuộc nền tảng hiện tại
+  useEffect(() => {
+    if (selectedFilter && selectedFilter !== 'all') {
+      const exists = availableJobs.some(
+        (u) => String(u.id) === String(selectedFilter) ||
+               String(u.filterValue) === String(selectedFilter) ||
+               String(u.app_identifier) === String(selectedFilter)
+      );
+      if (!exists) {
+        setSelectedFilter('all');
+      }
+    }
+  }, [platformScope, availableJobs]);
+
+  // ---- Thống kê sự kiện (funnel) ----
+  const fetchFunnels = async (scope = platformScope) => {
+    try {
+      const response = await fetch(`${API_MONITOR_URL}/funnels?platform=${encodeURIComponent(scope || 'all')}`, {
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) return;
+      const data = await response.json();
+      if (!Array.isArray(data)) return;
+      setFunnels(data);
+      setActiveFunnel((current) => {
+        if (current && data.some((item) => item.funnel_key === current)) return current;
+        return data[0]?.funnel_key || '';
+      });
+    } catch (err) {
+      console.warn('Không tải được danh sách funnel:', err);
+    }
+  };
+
+  // Khi đổi phân hệ (Web <-> App), dọn sạch dữ liệu cũ và nạp lại toàn bộ telemetry mới
+  useEffect(() => {
+    setLogs([]);
+    setCrashes([]);
+    setEvents([]);
+    telemetryRef.current = { logs: [], crashes: [], events: [] };
+    setSelectedFilter('all');
+    setDeviceFilter('all');
+    setUserFilter('all');
+    fetchFilterMetadata(platformScope);
+    fetchAllTelemetry('all', 'all', 'all', { incremental: false });
+    fetchFunnels(platformScope);
+  }, [platformScope]);
+
+  const fetchFunnelStats = async (overrides = {}) => {
+    const funnelKey = overrides.funnel ?? activeFunnel;
+    if (!funnelKey) {
+      setFunnelStats(null);
+      return;
+    }
+
+    try {
+      setStatsLoading(true);
+      const params = new URLSearchParams({
+        funnel: funnelKey,
+        days: String(overrides.days ?? statsRange),
+      });
+
+      // Thống kê bám theo đúng bộ lọc đang chọn ở đầu trang
+      if (platformScope) params.set('platform', platformScope);
+      const appId = activeUserJob?.app_identifier;
+      if (appId) params.set('app_identifier', appId);
+      if (deviceFilter && deviceFilter !== 'all') params.set('device', deviceFilter);
+      if (userFilter && userFilter !== 'all') params.set('user', userFilter);
+
+      const response = await fetch(`${API_MONITOR_URL}/events/stats?${params.toString()}`, {
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      setFunnelStats(data);
+      setStatsError(null);
+    } catch (err) {
+      setFunnelStats(null);
+      setStatsError(err.message);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
+  const openFunnelSetup = async (funnelKey = null) => {
+    const existing = funnelKey ? funnels.find((item) => item.funnel_key === funnelKey) : null;
+    setFunnelDraft(
+      existing
+        ? {
+            funnel_key: existing.funnel_key,
+            name: existing.name,
+            event_prefix: existing.event_prefix || '',
+            app_identifier: existing.app_identifier || '',
+            isEdit: true,
+          }
+        : { funnel_key: '', name: '', event_prefix: '', app_identifier: '', isEdit: false }
+    );
+    setFunnelSetupOpen(true);
+
+    try {
+      const response = await fetch(`${API_MONITOR_URL}/events/catalog`, { cache: 'no-store' });
+      if (response.ok) setEventCatalog(await response.json());
+    } catch (err) {
+      console.warn('Không tải được danh mục sự kiện:', err);
+    }
+  };
+
+  const saveFunnel = async () => {
+    if (!funnelDraft.funnel_key.trim() || !funnelDraft.name.trim()) return;
+    try {
+      setSavingFunnel(true);
+      const response = await fetch(`${API_MONITOR_URL}/funnels`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          funnel_key: funnelDraft.funnel_key.trim(),
+          name: funnelDraft.name.trim(),
+          event_prefix: funnelDraft.event_prefix.trim(),
+          app_identifier: funnelDraft.app_identifier?.trim() || null,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error || `HTTP ${response.status}`);
+
+      await fetchFunnels();
+      setActiveFunnel(data.funnel.funnel_key);
+      setFunnelSetupOpen(false);
+      fetchFunnelStats({ funnel: data.funnel.funnel_key });
+    } catch (err) {
+      setStatsError(err.message);
+    } finally {
+      setSavingFunnel(false);
+    }
+  };
+
+  const deleteFunnel = async (funnelKey) => {
+    try {
+      await fetch(`${API_MONITOR_URL}/funnels?funnel_key=${encodeURIComponent(funnelKey)}`, {
+        method: 'DELETE',
+      });
+      setFunnelSetupOpen(false);
+      await fetchFunnels();
+    } catch (err) {
+      setStatsError(err.message);
+    }
+  };
+
+  useEffect(() => {
+    fetchFunnels();
+  }, []);
+
+  // Chỉ gọi API thống kê khi thực sự đang xem tab đó, tránh tốn băng thông WebView
+  useEffect(() => {
+    if (telemetryMode !== 'funnels') return;
+    fetchFunnelStats();
+  }, [telemetryMode, activeFunnel, statsRange, selectedFilter, deviceFilter, userFilter]);
+
+
+  // Integration Snippets
+  const flutterCrashlyticsSnippet = `// 1. Tự động ghi nhận Crash trong main.dart của Flutter
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  AppTelemetry.initialize(appId: '${currentAppId}');
+
+  // Bắt mọi lỗi Flutter Framework / Render
+  FlutterError.onError = (FlutterErrorDetails details) {
+    AppTelemetry.recordCrash(
+      exception: details.exception,
+      stack: details.stack,
+      isFatal: true,
+      deviceInfo: {'app': '${currentAppId}'},
+    );
+    // Vẫn ghi vào Firebase Crashlytics nếu dùng song song:
+    // FirebaseCrashlytics.instance.recordFlutterFatalError(details);
+  };
+
+  // Bắt mọi lỗi bất đồng bộ (Uncaught Async Errors)
+  PlatformDispatcher.instance.onError = (error, stack) {
+    AppTelemetry.recordCrash(
+      exception: error,
+      stack: stack,
+      isFatal: true,
+    );
+    return true;
+  };
+
+  runApp(const MyApp());
+}
+
+// 2. Ghi nhận lỗi có try/catch (Non-fatal)
+try {
+  // Thực hiện tác vụ...
+} catch (e, stack) {
+  AppTelemetry.recordCrash(
+    exception: e,
+    stack: stack,
+    isFatal: false,
+  );
+}`;
+
+  const flutterAnalyticsSnippet = `// 1. Ghi nhận sự kiện người dùng (Custom Event)
+AppTelemetry.logEvent('login_success', parameters: {
+  'role': 'user',
+  'phone': '0394264400',
+  'method': 'password',
+});
+
+// 2. Ghi nhận chuyển màn hình (Screen View)
+AppTelemetry.logScreenView('HomeScreen', parameters: {
+  'tab_index': 0,
+});
+
+// 3. Sử dụng song song với Firebase Analytics
+// Gọi đồng thời cả FirebaseAnalytics.instance.logEvent(...) và AppTelemetry.logEvent(...)`;
+
+  const flutterClientSnippet = `import 'package:http/http.dart' as http;
+import 'api_logger.dart';
+
+// Tự động gửi telemetry API với App ID của ${activeUserJob?.name || 'ứng dụng'}
+final http.Client client = LoggingClient(
+  http.Client(), 
+  appId: '${currentAppId}',
+);`;
+
+  const flutterDioSnippet = `// Gán App ID vào Dio Interceptor
+ApiLogger.record(
+  endpoint: response.requestOptions.uri.toString(),
+  method: response.requestOptions.method,
+  statusCode: response.statusCode ?? 200,
+  responsePayload: response.data,
+  durationMs: 120,
+  appId: '${currentAppId}',
+);`;
+
+  const webAxiosSnippet = `import { setupAxiosMonitor } from './utils/api-logger';
+import axios from 'axios';
+
+// Gắn telemetry cho toàn bộ Web App
+setupAxiosMonitor(axios, '${currentAppId}');`;
+
+  const webFetchSnippet = `import { createMonitoredFetch } from './utils/api-logger';
+
+// Sử dụng monitoredFetch thay cho fetch mặc định
+const monitoredFetch = createMonitoredFetch('${currentAppId}');
+const res = await monitoredFetch('https://api.example.com/data');`;
+
+  const angularSnippet = `// 1. Cấu hình trong app.config.ts (Angular 15-19+ Standalone)
+import { ApplicationConfig, ErrorHandler } from '@angular/core';
+import { provideHttpClient, withInterceptors } from '@angular/common/http';
+import { ApiLoggerService, apiLoggerInterceptor, GlobalErrorHandler } from './core/services/api-logger.service';
+
+ApiLoggerService.initialize({
+  appId: '${currentAppId}',
+  serverUrl: '${API_MONITOR_URL}',
+});
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    provideHttpClient(withInterceptors([apiLoggerInterceptor])),
+    { provide: ErrorHandler, useClass: GlobalErrorHandler },
+  ],
+};
+
+// 2. Cập nhật Tên Người Dùng sau khi Login (trong AuthService/LoginComponent):
+// ApiLoggerService.setUserName(user.fullName || user.username);`;
+
+  const formatDate = (dateString) => formatVietnamDateTime(dateString);
+
+  const getStatusMeta = (statusCode) => {
+    const code = Number(statusCode);
+    if (code >= 200 && code < 300) {
+      return { type: '200', badgeClass: 'status-200', pillClass: 'pill-success', label: 'OK' };
+    }
+    if (code >= 400 && code < 500) {
+      return { type: '400', badgeClass: 'status-400', pillClass: 'pill-warning', label: 'Client Error' };
+    }
+    return { type: '500', badgeClass: 'status-500', pillClass: 'pill-danger', label: 'Server Error' };
+  };
+
+  const parseJsonSafe = (data) => {
+    if (data === undefined || data === null) return null;
+    if (typeof data !== 'string') return data;
+    try {
+      return JSON.parse(data);
+    } catch {
+      return data;
+    }
+  };
+
+  const formatJsonPretty = (data) => {
+    const parsed = parseJsonSafe(data);
+    if (parsed === null) return 'null';
+    if (typeof parsed === 'object') {
+      return JSON.stringify(parsed, null, 2);
+    }
+    return String(parsed);
+  };
+
+  const getSummarySnippet = (log) => {
+    const meta = getStatusMeta(log.status_code);
+    if (meta.type === '200') {
+      if (!log.response_payload) return '📦 Trả về 200 OK (Không có payload)';
+      const payloadStr = typeof log.response_payload === 'string'
+        ? log.response_payload
+        : JSON.stringify(log.response_payload);
+      const trimmed = payloadStr.trim();
+      if (trimmed.startsWith('[')) {
+        return '📦 Data: [Danh sách mảng dữ liệu]';
+      }
+      if (trimmed.startsWith('{')) {
+        // Trích xuất key nhanh bằng regex, không parse JSON nặng làm đơ WebView
+        const matches = trimmed.slice(0, 250).match(/"([^"]+)":/g);
+        if (matches && matches.length > 0) {
+          const keys = matches.slice(0, 3).map((k) => k.replace(/[" :]/g, '')).join(', ');
+          return `📦 Data: { ${keys}${matches.length > 3 ? ', …' : ''} }`;
+        }
+        return '📦 Data: { JSON Object }';
+      }
+      return `📦 Data: ${trimmed.substring(0, 45)}…`;
+    }
+    if (meta.type === '400') {
+      return `⚠️ 4xx: ${log.error_message || 'Yêu cầu không hợp lệ'}`;
+    }
+    return `🚨 5xx: ${log.error_message || 'Lỗi hệ thống máy chủ'}`;
+  };
+
+  const generateCurlCommand = (log) => {
+    let curl = `curl -X ${log.method || 'GET'} "${log.endpoint}"`;
+    if (log.request_payload) {
+      const dataStr = typeof log.request_payload === 'string' 
+        ? log.request_payload 
+        : JSON.stringify(log.request_payload);
+      curl += ` \\\n  -H "Content-Type: application/json" \\\n  -d '${dataStr.replace(/'/g, "'\\''")}'`;
+    }
+    return curl;
+  };
+
+  // Lọc tập dữ liệu theo Platform Scope (Quản lý Web thì chỉ hiển thị Web, Quản lý App thì chỉ hiển thị App)
+  const scopedLogs = useMemo(() => {
+    let list = logs;
+    if (platformScope === 'web') {
+      list = list.filter((l) => l.job_type === 'web' || isItemWeb(l));
+    } else if (platformScope === 'app') {
+      list = list.filter((l) => l.job_type === 'app' || (!isItemWeb(l) && l.job_type !== 'web'));
+    }
+    if (selectedFilter !== 'all') {
+      list = list.filter(
+        (l) =>
+          String(l.job_id) === String(selectedFilter) ||
+          String(l.app_identifier) === String(selectedFilter) ||
+          String(l.user_id) === String(selectedFilter)
+      );
+    }
+    return list;
+  }, [logs, selectedFilter, platformScope]);
+
+  const scopedCrashes = useMemo(() => {
+    let list = crashes;
+    if (platformScope === 'web') {
+      list = list.filter((c) => c.job_type === 'web' || isItemWeb(c));
+    } else if (platformScope === 'app') {
+      list = list.filter((c) => c.job_type === 'app' || (!isItemWeb(c) && c.job_type !== 'web'));
+    }
+    if (selectedFilter !== 'all') {
+      list = list.filter(
+        (c) =>
+          String(c.job_id) === String(selectedFilter) ||
+          String(c.app_identifier) === String(selectedFilter)
+      );
+    }
+    return list;
+  }, [crashes, selectedFilter, platformScope]);
+
+  const scopedEvents = useMemo(() => {
+    let list = events;
+    if (platformScope === 'web') {
+      list = list.filter((e) => e.job_type === 'web' || isItemWeb(e));
+    } else if (platformScope === 'app') {
+      list = list.filter((e) => e.job_type === 'app' || (!isItemWeb(e) && e.job_type !== 'web'));
+    }
+    if (selectedFilter !== 'all') {
+      list = list.filter(
+        (e) =>
+          String(e.job_id) === String(selectedFilter) ||
+          String(e.app_identifier) === String(selectedFilter) ||
+          String(e.user_id) === String(selectedFilter)
+      );
+    }
+    return list;
+  }, [events, selectedFilter, platformScope]);
+
+  // Status counters for Logs
+  const totalCalls = scopedLogs.length;
+  const count200 = scopedLogs.filter((log) => log.status_code >= 200 && log.status_code < 300).length;
+  const count400 = scopedLogs.filter((log) => log.status_code >= 400 && log.status_code < 500).length;
+  const count500 = scopedLogs.filter((log) => log.status_code >= 500 || log.status_code < 200).length;
+  const successRate = totalCalls > 0 ? Math.round((count200 / totalCalls) * 100) : null;
+  const totalDuration = scopedLogs.reduce((acc, log) => acc + (Number(log.duration_ms) || 0), 0);
+  const avgDuration = totalCalls > 0 ? Math.round(totalDuration / totalCalls) : 0;
+
+  // Status counters for Crashes
+  const totalCrashes = scopedCrashes.length;
+  const fatalCrashes = scopedCrashes.filter((c) => Number(c.is_fatal) === 1).length;
+  const nonFatalCrashes = scopedCrashes.filter((c) => Number(c.is_fatal) !== 1).length;
+  const affectedAppsCount = new Set(scopedCrashes.map((c) => c.app_identifier).filter(Boolean)).size;
+
+  // Status counters for Analytics
+  const totalEvents = scopedEvents.length;
+  const screenViewCount = scopedEvents.filter((e) => e.event_type === 'screen_view' || e.event_name === 'screen_view').length;
+  const customEventCount = totalEvents - screenViewCount;
+  const uniqueUsersCount = new Set(scopedEvents.map((e) => e.user_id).filter(Boolean)).size;
+
+  // Danh sách Thiết bị / Trình duyệt duy nhất theo Platform Scope
+  const uniqueDevices = useMemo(() => {
+    const set = new Set();
+
+    const addDevice = (d) => {
+      if (!d) return;
+      const str = String(d).trim();
+      if (!str) return;
+
+      if (platformScope === 'web') {
+        if (isDeviceWeb(str)) set.add(str);
+      } else if (platformScope === 'app') {
+        if (!isDeviceWeb(str) || str.toLowerCase().includes('android') || str.toLowerCase().includes('ios') || str.toLowerCase().includes('iphone') || str.toLowerCase().includes('samsung')) {
+          set.add(str);
+        }
+      } else {
+        set.add(str);
+      }
+    };
+
+    scopedLogs.forEach((l) => { if (l.device_name) addDevice(l.device_name); });
+    scopedCrashes.forEach((c) => {
+      if (c.device_info) {
+        try {
+          const parsed = JSON.parse(c.device_info);
+          addDevice(parsed.browser || parsed.device || parsed.model || parsed.name);
+        } catch {
+          addDevice(c.device_info);
+        }
+      }
+    });
+    scopedEvents.forEach((e) => {
+      if (e.device_info) {
+        try {
+          const parsed = JSON.parse(e.device_info);
+          addDevice(parsed.browser || parsed.device || parsed.model || parsed.name);
+        } catch {
+          addDevice(e.device_info);
+        }
+      }
+    });
+
+    if (Array.isArray(filterMeta.devices)) {
+      filterMeta.devices.forEach(addDevice);
+    }
+
+    return Array.from(set).filter(Boolean).sort();
+  }, [scopedLogs, scopedCrashes, scopedEvents, filterMeta.devices, platformScope]);
+
+  // Danh sách Người dùng duy nhất theo Platform Scope
+  const uniqueUsers = useMemo(() => {
+    const set = new Set();
+
+    // Lấy user thuộc về các job của platform hiện tại
+    availableJobs.forEach((job) => {
+      if (job.name && job.name !== 'Hệ thống') set.add(String(job.name));
+    });
+
+    scopedLogs.forEach((l) => { if (l.user_name) set.add(String(l.user_name)); });
+    scopedCrashes.forEach((c) => { if (c.user_name) set.add(String(c.user_name)); });
+    scopedEvents.forEach((e) => {
+      if (e.user_name) set.add(String(e.user_name));
+      else if (e.user_id) set.add(String(e.user_id));
+    });
+    return Array.from(set).filter(Boolean).sort();
+  }, [availableJobs, scopedLogs, scopedCrashes, scopedEvents]);
+
+  // Tự động reset deviceFilter và userFilter nếu giá trị đang chọn không thuộc nền tảng hiện tại
+  useEffect(() => {
+    if (deviceFilter !== 'all' && !uniqueDevices.includes(deviceFilter)) {
+      setDeviceFilter('all');
+    }
+  }, [uniqueDevices, deviceFilter]);
+
+  useEffect(() => {
+    if (userFilter !== 'all' && !uniqueUsers.includes(userFilter)) {
+      setUserFilter('all');
+    }
+  }, [uniqueUsers, userFilter]);
+
+  // Filter and search Logs
+  const filteredLogs = useMemo(() => {
+    return scopedLogs.filter((log) => {
+      const matchesTab = (() => {
+        if (activeTab === 'all') return true;
+        if (activeTab === '200') return log.status_code >= 200 && log.status_code < 300;
+        if (activeTab === '400') return log.status_code >= 400 && log.status_code < 500;
+        if (activeTab === '500') return log.status_code >= 500 || log.status_code < 200;
+        return true;
+      })();
+
+      if (!matchesTab) return false;
+      if (deviceFilter !== 'all' && log.device_name !== deviceFilter) return false;
+      if (userFilter !== 'all' && log.user_name !== userFilter) return false;
+
+      if (!searchTerm) return true;
+      const lowerSearch = searchTerm.toLowerCase();
+      const endpointMatch = toSearchText(log.endpoint).includes(lowerSearch);
+      const statusMatch = toSearchText(log.status_code).includes(lowerSearch);
+      const errorMatch = toSearchText(log.error_message).includes(lowerSearch);
+      const appMatch = toSearchText(log.app_identifier).includes(lowerSearch);
+      const userMatch = toSearchText(log.user_name).includes(lowerSearch);
+      const deviceMatch = toSearchText(log.device_name).includes(lowerSearch);
+      const ipMatch = toSearchText(log.ip_address).includes(lowerSearch);
+      const jobMatch = toSearchText(log.job_name).includes(lowerSearch);
+
+      return endpointMatch || statusMatch || errorMatch || appMatch || userMatch || jobMatch || deviceMatch || ipMatch;
+    });
+  }, [scopedLogs, activeTab, searchTerm, deviceFilter, userFilter]);
+
+  // Filter and search Crashes
+  const filteredCrashes = useMemo(() => {
+    return scopedCrashes.filter((crash) => {
+      if (crashTab === 'fatal' && Number(crash.is_fatal) !== 1) return false;
+      if (crashTab === 'non-fatal' && Number(crash.is_fatal) === 1) return false;
+
+      if (deviceFilter !== 'all') {
+        const dLower = deviceFilter.toLowerCase();
+        if (!toSearchText(crash.device_info).includes(dLower)) return false;
+      }
+      if (userFilter !== 'all' && crash.user_name !== userFilter) return false;
+
+      if (!searchTerm) return true;
+      const lower = searchTerm.toLowerCase();
+      const msgMatch = toSearchText(crash.error_message).includes(lower);
+      const stackMatch = toSearchText(crash.stack_trace).includes(lower);
+      const appMatch = toSearchText(crash.app_identifier).includes(lower);
+      const userMatch = toSearchText(crash.user_name).includes(lower);
+      const jobMatch = toSearchText(crash.job_name).includes(lower);
+      const deviceMatch = toSearchText(crash.device_info).includes(lower);
+
+      return msgMatch || stackMatch || appMatch || userMatch || jobMatch || deviceMatch;
+    });
+  }, [scopedCrashes, crashTab, searchTerm, deviceFilter, userFilter]);
+
+  // Filter and search Analytics
+  const filteredEvents = useMemo(() => {
+    return scopedEvents.filter((event) => {
+      const isScreen = event.event_type === 'screen_view' || event.event_name === 'screen_view';
+      if (eventTab === 'screen_view' && !isScreen) return false;
+      if (eventTab === 'custom' && isScreen) return false;
+
+      if (deviceFilter !== 'all') {
+        const dLower = deviceFilter.toLowerCase();
+        if (!toSearchText(event.device_info).includes(dLower)) return false;
+      }
+      if (userFilter !== 'all') {
+        if (String(event.user_name ?? '') !== userFilter && String(event.user_id ?? '') !== userFilter) return false;
+      }
+
+      if (!searchTerm) return true;
+      const lower = searchTerm.toLowerCase();
+      const nameMatch = toSearchText(event.event_name).includes(lower);
+      const screenMatch = toSearchText(event.screen_name).includes(lower);
+      const userMatch = toSearchText(event.user_id).includes(lower) || toSearchText(event.user_name).includes(lower);
+      const appMatch = toSearchText(event.app_identifier).includes(lower);
+      const jobMatch = toSearchText(event.job_name).includes(lower);
+      const paramMatch = toSearchText(event.parameters).includes(lower);
+
+      return nameMatch || screenMatch || userMatch || appMatch || jobMatch || paramMatch;
+    });
+  }, [scopedEvents, eventTab, searchTerm, deviceFilter, userFilter]);
+
+  // Sliced data cho phân trang (Cắt nhỏ danh sách hiển thị, tăng tốc 60 FPS cho WebView)
+  const paginatedLogs = useMemo(() => {
+    const start = (logsPage - 1) * logsPageSize;
+    return filteredLogs.slice(start, start + logsPageSize);
+  }, [filteredLogs, logsPage, logsPageSize]);
+
+  const paginatedCrashes = useMemo(() => {
+    const start = (crashPage - 1) * crashPageSize;
+    return filteredCrashes.slice(start, start + crashPageSize);
+  }, [filteredCrashes, crashPage, crashPageSize]);
+
+  const paginatedEvents = useMemo(() => {
+    const start = (eventPage - 1) * eventPageSize;
+    return filteredEvents.slice(start, start + eventPageSize);
+  }, [filteredEvents, eventPage, eventPageSize]);
+
+  return (
+    <div style={{ paddingTop: '1.25rem' }}>
+      {/* Page Title & Controls */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.25rem', flexWrap: 'wrap', gap: '1rem' }}>
+        <div>
+          <h2 style={{ fontSize: '1.45rem', fontWeight: 700, margin: 0, color: 'var(--text)' }}>
+            Giám sát Logs & Telemetry
+          </h2>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginTop: '0.2rem' }}>
+            Theo dõi thời gian thực: API Calls, Firebase Crashlytics và Firebase Analytics từ Mobile App & Web.
+          </p>
+        </div>
+
+        <div className="topbar-actions">
+          <div className="auto-refresh-dock">
+            <span style={{ fontSize: '0.78rem' }}>Tự làm mới:</span>
+            <CustomSelect
+              className="select-mini"
+              value={refreshInterval}
+              onChange={(val) => setRefreshInterval(Number(val))}
+              options={[
+                { value: 0, label: 'Tắt (Tiết kiệm PIN)' },
+                { value: 10000, label: '10 giây' },
+                { value: 15000, label: '15 giây' },
+                { value: 30000, label: '30 giây' },
+                { value: 60000, label: '1 phút (tiết kiệm D1)' },
+                { value: 300000, label: '5 phút' },
+              ]}
+              alignRight={true}
+              ariaLabel="Chu kỳ tự động tải dữ liệu mới"
+            />
+          </div>
+          <button
+            type="button"
+            className="secondary-btn"
+            style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}
+            onClick={() => setTelegramModalOpen(true)}
+            title="Cài đặt thông báo sự cố qua Telegram Bot"
+          >
+            <span>🔔</span>
+            <span>Cảnh báo Telegram</span>
+          </button>
+          <button
+            type="button"
+            className="secondary-btn"
+            onClick={() => {
+              if (!integrationOpen) {
+                setSetupTab(platformScope === 'web' ? 'angular' : 'crashlytics');
+              }
+              setIntegrationOpen((prev) => !prev);
+            }}
+          >
+            🔌 Cấu hình SDK ({platformScope === 'web' ? 'Web / Angular' : 'Flutter App'})
+          </button>
+          <button
+            type="button"
+            className="primary-btn"
+            disabled={loading}
+            onClick={() => { setLoading(true); fetchAllTelemetry(); }}
+          >
+            {loading ? 'Đang tải…' : '🔄 Làm mới'}
+          </button>
+        </div>
+      </div>
+
+      {/* Thông báo thân thiện khi Cloudflare D1 chạm hạn mức ngày */}
+      {quotaExceeded && (
+        <div style={{
+          background: 'linear-gradient(135deg, rgba(255, 171, 0, 0.12), rgba(255, 87, 87, 0.08))',
+          border: '1px solid rgba(255, 171, 0, 0.35)',
+          borderRadius: '12px',
+          padding: '1rem 1.25rem',
+          marginBottom: '1.25rem',
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: '0.85rem',
+        }}>
+          <span style={{ fontSize: '1.35rem', lineHeight: 1 }}>⚠️</span>
+          <div style={{ fontSize: '0.85rem', lineHeight: 1.55 }}>
+            <strong style={{ color: '#ffb300', display: 'block', fontSize: '0.92rem', marginBottom: '0.2rem' }}>
+              Tài khoản Cloudflare D1 Free Tier đã chạm hạn mức đọc trong ngày (5.000.000 rows/ngày)
+            </strong>
+            <span style={{ color: 'var(--text-muted)' }}>
+              Đã tối ưu hoàn tất <strong>Composite Indexes</strong> và <strong>Edge Memory Cache</strong> cho database <code>flow-api</code> mới (giảm 99% tải đọc). 
+              Hệ thống đã tự động tạm dừng polling để tránh gửi request thừa. Cloudflare sẽ tự động mở lại hạn mức vào <strong>00:00 UTC (07:00 sáng mai)</strong>, hoặc bạn có thể nâng cấp lên Cloudflare Workers Paid ($5/tháng) để dùng ngay lập tức với 25 tỷ rows/tháng.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* 24-hour System Health Summary */}
+      <SystemHealthSummary
+        selectedApp={selectedFilter !== 'all' ? selectedFilter : ''}
+        platformScope={platformScope}
+      />
+
+      {/* Mode Switcher Dock: Issues | Logs | Crashlytics | Analytics | Funnels | Timeline */}
+      <div className="telemetry-mode-dock">
+        <button
+          type="button"
+          className={`mode-pill-btn ${telemetryMode === 'issues' ? 'active' : ''}`}
+          onClick={() => { setTelemetryMode('issues'); setSearchTerm(''); }}
+        >
+          <span>🚨 Sự cố (Issues)</span>
+          <span
+            className="mode-badge"
+            style={{
+              backgroundColor: unresolvedIssuesCount > 0 && telemetryMode !== 'issues' ? 'rgba(255, 119, 133, 0.25)' : undefined,
+              color: unresolvedIssuesCount > 0 && telemetryMode !== 'issues' ? '#ff7785' : undefined,
+            }}
+          >
+            {unresolvedIssuesCount}
+          </span>
+        </button>
+        <button
+          type="button"
+          className={`mode-pill-btn ${telemetryMode === 'logs' ? 'active' : ''}`}
+          onClick={() => { setTelemetryMode('logs'); setSearchTerm(''); }}
+        >
+          <span>{platformScope === 'web' ? '📡 Nhật ký Web' : '📡 API Logs'}</span>
+          <span className="mode-badge">{scopedLogs.length}</span>
+        </button>
+        <button
+          type="button"
+          className={`mode-pill-btn ${telemetryMode === 'crashes' ? 'active' : ''}`}
+          onClick={() => { setTelemetryMode('crashes'); setSearchTerm(''); }}
+        >
+          <span>{platformScope === 'web' ? '💥 Sự cố & Lỗi JS' : '💥 Crashlytics'}</span>
+          <span
+            className="mode-badge"
+            style={{
+              backgroundColor: fatalCrashes > 0 && telemetryMode !== 'crashes' ? 'rgba(255, 119, 133, 0.25)' : undefined,
+              color: fatalCrashes > 0 && telemetryMode !== 'crashes' ? '#ff7785' : undefined,
+            }}
+          >
+            {scopedCrashes.length}
+          </span>
+        </button>
+        <button
+          type="button"
+          className={`mode-pill-btn ${telemetryMode === 'analytics' ? 'active' : ''}`}
+          onClick={() => { setTelemetryMode('analytics'); setSearchTerm(''); }}
+        >
+          <span>{platformScope === 'web' ? '📈 Tương tác Web' : '📈 Analytics & Sự kiện'}</span>
+          <span className="mode-badge">{scopedEvents.length}</span>
+        </button>
+        <button
+          type="button"
+          className={`mode-pill-btn ${telemetryMode === 'funnels' ? 'active' : ''}`}
+          onClick={() => { setTelemetryMode('funnels'); setSearchTerm(''); }}
+        >
+          <span>📊 Thống kê sự kiện</span>
+          <span className="mode-badge">{funnels.length}</span>
+        </button>
+        <button
+          type="button"
+          className={`mode-pill-btn ${telemetryMode === 'timeline' ? 'active' : ''}`}
+          onClick={() => { setTelemetryMode('timeline'); setSearchTerm(''); }}
+        >
+          <span>🧭 Hành trình User</span>
+          {timelineUser && (
+            <span className="mode-badge" style={{ backgroundColor: 'var(--accent-strong)', color: '#fff' }}>
+              {timelineUser.slice(0, 10)}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {/* User & Job Selector Dock */}
+      <div className="user-filter-dock">
+        <div className="user-filter-info">
+          <span style={{ fontSize: '1.3rem' }}>🎯</span>
+          <div>
+            <strong>Mục tiêu giám sát:</strong>
+            <span style={{ fontSize: '0.86rem', color: 'var(--text-muted)', marginLeft: '0.5rem' }}>
+              {activeUserJob ? (
+                <>
+                  <span className={`type-badge ${activeUserJob.job_type === 'app' ? 'type-badge-app' : 'type-badge-web'}`} style={{ marginRight: '0.45rem' }}>
+                    {activeUserJob.job_type === 'app' ? '📱 App' : '🌐 Web'}
+                  </span>
+                  <b style={{ color: 'var(--text)' }}>{activeUserJob.job_name}</b>
+                  <span style={{ color: 'var(--text-dim)' }}> — Người phụ trách: {activeUserJob.name} (<code>{activeUserJob.app_identifier}</code>)</span>
+                </>
+              ) : (
+                platformScope === 'web'
+                  ? 'Toàn bộ Web App (Chỉ hiển thị API & Telemetry từ Web)'
+                  : 'Toàn bộ Mobile App (Chỉ hiển thị dữ liệu từ App di động)'
+              )}
+            </span>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+          <button
+            type="button"
+            onClick={openPlatformModal}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '0.4rem',
+              padding: '0.38rem 0.75rem',
+              borderRadius: '20px',
+              border: `1px solid ${platformScope === 'web' ? 'rgba(34, 211, 238, 0.45)' : 'rgba(167, 139, 250, 0.45)'}`,
+              background: platformScope === 'web' ? 'rgba(34, 211, 238, 0.12)' : 'rgba(167, 139, 250, 0.12)',
+              color: platformScope === 'web' ? '#67e8f9' : '#c4b5fd',
+              fontSize: '0.78rem',
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+            title="Bấm để đổi không gian quản lý giữa Web và App"
+          >
+            <span>{platformScope === 'web' ? '🌐 Phạm vi: Web App' : '📱 Phạm vi: Mobile App'}</span>
+            <span style={{ fontSize: '0.7rem', opacity: 0.8 }}>⇄ Đổi</span>
+          </button>
+
+          <CustomSelect
+            className="user-filter-custom"
+            value={selectedFilter}
+            onChange={(val) => handleFilterChange(val)}
+            options={[
+              {
+                value: 'all',
+                label: platformScope === 'web'
+                  ? '🌐 Toàn bộ Web App (Tất cả web telemetry)'
+                  : '📱 Toàn bộ Mobile App (Tất cả app telemetry)',
+              },
+              ...availableJobs.map((u) => ({
+                value: u.filterValue || u.id,
+                label: `${u.job_type === 'app' ? '📱' : '🌐'} ${u.job_name}${u.app_identifier ? ` (${u.app_identifier})` : ''}`,
+              })),
+            ]}
+            ariaLabel="Chọn mục tiêu giám sát"
+            placeholder="Chọn mục tiêu giám sát..."
+          />
+
+          {selectedFilter !== 'all' && (
+            <button
+              type="button"
+              className="view-btn"
+              style={{ fontSize: '0.78rem', padding: '0.5rem 0.85rem' }}
+              onClick={() => handleFilterChange('all')}
+            >
+              ✕ Xem tất cả
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Dynamic Metrics Summary Strip depending on active Mode */}
+      {telemetryMode === 'logs' && (
+        <section className="metrics-strip" aria-label="API telemetry summary">
+          <div className="metric-item metric-lead">
+            <span>Tổng số cuộc gọi</span>
+            <strong>{totalCalls}</strong>
+            <small>{selectedFilter === 'all' ? (platformScope === 'web' ? 'Toàn bộ Web App' : 'Toàn bộ Mobile App') : `Cho ${activeUserJob?.name}`}</small>
+          </div>
+          <div className="metric-item">
+            <span>200 OK (Thành công)</span>
+            <strong className="metric-success">{count200}</strong>
+            <small>{successRate !== null ? `${successRate}% tỷ lệ thành công` : 'Chưa có log'}</small>
+          </div>
+          <div className="metric-item">
+            <span>4xx Lỗi Client</span>
+            <strong style={{ color: count400 ? 'var(--warning)' : 'inherit' }}>{count400}</strong>
+            <small>{count400 ? 'Sai tham số / Xác thực' : 'Không có lỗi 4xx'}</small>
+          </div>
+          <div className="metric-item">
+            <span>5xx Lỗi Server</span>
+            <strong className={count500 ? 'metric-error' : ''}>{count500}</strong>
+            <small>{count500 ? 'Ngoại lệ máy chủ' : 'Hệ thống ổn định'}</small>
+          </div>
+          <div className="metric-item">
+            <span>Độ trễ trung bình</span>
+            <strong>{avgDuration}<em>ms</em></strong>
+            <small>Thời gian phản hồi</small>
+          </div>
+        </section>
+      )}
+
+      {telemetryMode === 'crashes' && (
+        <section className="metrics-strip" aria-label="Crashlytics summary">
+          <div className="metric-item metric-lead">
+            <span>Tổng sự cố ghi nhận</span>
+            <strong>{totalCrashes}</strong>
+            <small>{selectedFilter === 'all' ? (platformScope === 'web' ? 'Toàn bộ Web App' : 'Toàn bộ Mobile App') : `Cho ${activeUserJob?.name}`}</small>
+          </div>
+          <div className="metric-item">
+            <span>{platformScope === 'web' ? 'Fatal Errors (Sập trang/Runtime)' : 'Fatal Crashes (Sập App)'}</span>
+            <strong style={{ color: fatalCrashes > 0 ? '#ff7785' : 'var(--success)' }}>
+              {fatalCrashes}
+            </strong>
+            <small>{fatalCrashes > 0 ? 'Cần xử lý khẩn cấp' : 'Không có crash fatal'}</small>
+          </div>
+          <div className="metric-item">
+            <span>Non-Fatal (Ngoại lệ)</span>
+            <strong style={{ color: nonFatalCrashes > 0 ? 'var(--warning)' : 'inherit' }}>
+              {nonFatalCrashes}
+            </strong>
+            <small>{nonFatalCrashes > 0 ? 'Ngoại lệ đã bắt try/catch' : 'Hoàn hảo'}</small>
+          </div>
+          <div className="metric-item">
+            <span>{platformScope === 'web' ? 'Trạng thái Web App' : 'Trạng thái App'}</span>
+            <strong className={fatalCrashes === 0 ? 'metric-success' : 'metric-error'}>
+              {fatalCrashes === 0 ? '100% Ổn định' : 'Có lỗi nghiêm trọng'}
+            </strong>
+            <small>Độ tin cậy ứng dụng</small>
+          </div>
+          <div className="metric-item">
+            <span>{platformScope === 'web' ? 'Số Trình duyệt ảnh hưởng' : 'Số Thiết bị ảnh hưởng'}</span>
+            <strong>{affectedAppsCount}</strong>
+            <small>Mã định danh báo cáo</small>
+          </div>
+        </section>
+      )}
+
+      {telemetryMode === 'analytics' && (
+        <section className="metrics-strip" aria-label="Analytics summary">
+          <div className="metric-item metric-lead">
+            <span>Tổng lượt sự kiện</span>
+            <strong>{totalEvents}</strong>
+            <small>{selectedFilter === 'all' ? (platformScope === 'web' ? 'Toàn bộ Web App' : 'Toàn bộ Mobile App') : `Cho ${activeUserJob?.name}`}</small>
+          </div>
+          <div className="metric-item">
+            <span>{platformScope === 'web' ? 'Lượt xem trang (Page Views)' : 'Lượt xem màn hình (Screens)'}</span>
+            <strong style={{ color: '#61e5bd' }}>{screenViewCount}</strong>
+            <small>{platformScope === 'web' ? 'Chuyển route & page' : 'Chuyển trang & màn hình'}</small>
+          </div>
+          <div className="metric-item">
+            <span>Sự kiện tương tác (Custom)</span>
+            <strong style={{ color: 'var(--accent)' }}>{customEventCount}</strong>
+            <small>Click, login, giao dịch...</small>
+          </div>
+          <div className="metric-item">
+            <span>Người dùng định danh</span>
+            <strong style={{ color: '#c4b5fd' }}>{uniqueUsersCount}</strong>
+            <small>User ID phân biệt</small>
+          </div>
+          <div className="metric-item">
+            <span>Tần suất tương tác</span>
+            <strong>{totalEvents > 0 ? `${totalEvents} logs` : '0'}</strong>
+            <small>Thời gian thực</small>
+          </div>
+        </section>
+      )}
+
+      {telemetryMode === 'funnels' && funnelStats && funnelStats.totals.attempts > 0 && (
+        <section className="metrics-strip" aria-label="Tổng quan thống kê sự kiện">
+          <div className="metric-item metric-lead">
+            <span>Tổng lượt thử</span>
+            <strong>{funnelStats.totals.attempts}</strong>
+            <small>
+              {funnelStats.range.day_from === funnelStats.range.day_to
+                ? funnelStats.range.day_from
+                : `${funnelStats.range.day_from} → ${funnelStats.range.day_to}`}
+            </small>
+          </div>
+          <div className="metric-item">
+            <span>Hoàn tất</span>
+            <strong className="metric-success">
+              {funnelStats.rates.completion}<em>%</em>
+            </strong>
+            <small>
+              {funnelStats.totals.completed}/{funnelStats.totals.attempts} lượt thử
+              {funnelStats.totals.open > 0 ? ` · ${funnelStats.totals.open} đang dở` : ''}
+            </small>
+          </div>
+          <div className="metric-item">
+            <span>Thành công</span>
+            <strong>{funnelStats.rates.success}<em>%</em></strong>
+            <small>{funnelStats.totals.succeeded}/{funnelStats.totals.attempts} lượt thử</small>
+          </div>
+          <div className="metric-item">
+            <span>Tự động (không cần người duyệt)</span>
+            <strong style={{ color: 'var(--success)' }}>
+              {funnelStats.rates.auto}<em>%</em>
+            </strong>
+            <small>trên {funnelStats.totals.succeeded} lượt thành công</small>
+          </div>
+          <div className="metric-item">
+            <span>Thất bại</span>
+            <strong className={funnelStats.rates.failure > 0 ? 'metric-error' : ''}>
+              {funnelStats.rates.failure}<em>%</em>
+            </strong>
+            <small>
+              {funnelStats.rates.failure > 0 ? 'Có bước lỗi trước khi rời luồng' : 'Không có lượt lỗi'}
+            </small>
+          </div>
+        </section>
+      )}
+
+      {/* MODAL DIALOG: CẤU HÌNH SDK TELEMETRY */}
+      {integrationOpen && (
+        <div
+          className="modal-overlay"
+          onClick={() => setIntegrationOpen(false)}
+          style={{ zIndex: 1100 }}
+        >
+          <div
+            className="modal-content"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: 'min(920px, 95%)', maxHeight: '88vh', display: 'flex', flexDirection: 'column' }}
+          >
+            <div className="modal-header">
+              <div className="modal-header-info">
+                <span className="platform-tag" style={{ display: 'inline-block', marginBottom: '0.25rem' }}>
+                  {platformScope === 'web' ? '🌐 Web & Angular SDK' : '📱 Flutter Mobile SDK'}
+                </span>
+                <h2 style={{ fontSize: '1.2rem', fontWeight: 700, margin: 0 }}>
+                  Cấu hình SDK & Kết nối Telemetry
+                </h2>
+                <p style={{ margin: '0.25rem 0 0', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                  App ID: <code style={{ color: 'var(--accent)' }}>{currentAppId}</code> · Endpoint: <code>{API_MONITOR_URL}</code>
+                </p>
+              </div>
+              <div className="modal-header-actions">
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => copyToClipboard(API_MONITOR_URL, 'url')}
+                  style={{ fontSize: '0.8rem', padding: '0.4rem 0.75rem' }}
+                >
+                  {copiedItem === 'url' ? '✓ Đã chép' : '📋 Copy URL Server'}
+                </button>
+                <button
+                  type="button"
+                  className="close-btn"
+                  onClick={() => setIntegrationOpen(false)}
+                  aria-label="Đóng"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-body" style={{ overflowY: 'auto', padding: '1.25rem', flex: 1 }}>
+              <div className="integration-content" style={{ margin: 0 }}>
+                <nav className="setup-tabs">
+                  <button
+                    type="button"
+                    className={setupTab === 'angular' ? 'active' : ''}
+                    onClick={() => setSetupTab('angular')}
+                  >
+                    <span>{platformScope === 'web' ? '01' : '05'}</span>
+                    <strong>Angular Telemetry</strong>
+                    <small>HttpInterceptor & Errors</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={setupTab === 'axios' ? 'active' : ''}
+                    onClick={() => setSetupTab('axios')}
+                  >
+                    <span>{platformScope === 'web' ? '02' : '06'}</span>
+                    <strong>Web Axios</strong>
+                    <small>setupAxiosMonitor</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={setupTab === 'fetch' ? 'active' : ''}
+                    onClick={() => setSetupTab('fetch')}
+                  >
+                    <span>{platformScope === 'web' ? '03' : '07'}</span>
+                    <strong>Web Fetch</strong>
+                    <small>createMonitoredFetch</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={setupTab === 'crashlytics' ? 'active' : ''}
+                    onClick={() => setSetupTab('crashlytics')}
+                  >
+                    <span>{platformScope === 'web' ? '04' : '01'}</span>
+                    <strong>Flutter Crashlytics</strong>
+                    <small>Bắt Fatal & Non-fatal</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={setupTab === 'analytics' ? 'active' : ''}
+                    onClick={() => setSetupTab('analytics')}
+                  >
+                    <span>{platformScope === 'web' ? '05' : '02'}</span>
+                    <strong>Flutter Analytics</strong>
+                    <small>Events & Screen Views</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={setupTab === 'client' ? 'active' : ''}
+                    onClick={() => setSetupTab('client')}
+                  >
+                    <span>{platformScope === 'web' ? '06' : '03'}</span>
+                    <strong>Flutter HTTP</strong>
+                    <small>LoggingClient</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={setupTab === 'dio' ? 'active' : ''}
+                    onClick={() => setSetupTab('dio')}
+                  >
+                    <span>{platformScope === 'web' ? '07' : '04'}</span>
+                    <strong>Flutter Dio</strong>
+                    <small>ApiLogger.record()</small>
+                  </button>
+                </nav>
+
+                <div className="setup-content">
+                  {setupTab === 'crashlytics' && (
+                    <div className="setup-pane">
+                      <div className="pane-heading">
+                        <h3>1. Tích hợp Crashlytics (Bắt sập App & Ngoại lệ)</h3>
+                        <p>Hook trực tiếp vào <code>FlutterError.onError</code> và <code>PlatformDispatcher.instance.onError</code>:</p>
+                      </div>
+                      <CodeBlock
+                        label="Flutter Crashlytics Hook"
+                        value={flutterCrashlyticsSnippet}
+                        copyKey="crashlytics"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+                    </div>
+                  )}
+
+                  {setupTab === 'analytics' && (
+                    <div className="setup-pane">
+                      <div className="pane-heading">
+                        <h3>2. Tích hợp Analytics (Sự kiện & Màn hình người dùng)</h3>
+                        <p>Theo dõi luồng hành động người dùng, đăng nhập, click, xem màn hình song song với Firebase:</p>
+                      </div>
+                      <CodeBlock
+                        label="Flutter Analytics Event & Screen"
+                        value={flutterAnalyticsSnippet}
+                        copyKey="analytics"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+                    </div>
+                  )}
+
+                  {setupTab === 'client' && (
+                    <div className="setup-pane setup-pane-split">
+                      <div>
+                        <div className="pane-heading">
+                          <h3>3. Dùng LoggingClient cho package `http` (Flutter)</h3>
+                          <p>Tự động ghi lại payload 200 và chẩn đoán lỗi 400/500 kèm mã định danh theo dõi.</p>
+                        </div>
+                      </div>
+                      <CodeBlock
+                        label="Flutter http Client"
+                        value={flutterClientSnippet}
+                        copyKey="client"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+                    </div>
+                  )}
+
+                  {setupTab === 'dio' && (
+                    <div className="setup-pane">
+                      <div className="pane-heading">
+                        <h3>4. Tích hợp với package `Dio` (Flutter)</h3>
+                        <p>Gắn <code>ApiLogger.record()</code> vào interceptor với <code>appId</code>:</p>
+                      </div>
+                      <CodeBlock
+                        label="Dio Interceptor"
+                        value={flutterDioSnippet}
+                        copyKey="dio"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+                    </div>
+                  )}
+
+                  {setupTab === 'angular' && (
+                    <div className="setup-pane">
+                      <div className="pane-heading" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '0.85rem' }}>
+                        <div>
+                          <div style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.2rem 0.55rem', borderRadius: '12px', background: 'rgba(221, 0, 49, 0.12)', border: '1px solid rgba(221, 0, 49, 0.3)', marginBottom: '0.35rem', color: '#ff6b81', fontSize: '0.74rem', fontWeight: 600 }}>
+                            <span>🅰️</span> Angular SDK (Standalone & NgModule)
+                          </div>
+                          <h3 style={{ margin: '0.2rem 0' }}>Tích hợp Angular HttpInterceptor & ErrorHandler</h3>
+                          <p>Tự động ghi nhận mã lỗi 4xx/5xx, độ trễ và ngoại lệ JavaScript runtime gửi về Dashboard:</p>
+                        </div>
+                        <a
+                          href="/angular/api-logger.service.ts"
+                          download="api-logger.service.ts"
+                          className="secondary-btn"
+                          style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.45rem 0.85rem', fontSize: '0.8rem' }}
+                        >
+                          <span>📥</span> Tải file api-logger.service.ts
+                        </a>
+                      </div>
+
+                      <CodeBlock
+                        label="Angular Configuration (app.config.ts / Standalone)"
+                        value={angularSnippet}
+                        copyKey="angular"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+
+                      <div style={{ marginTop: '1.15rem', padding: '0.85rem 1rem', borderRadius: '10px', background: 'rgba(34, 211, 238, 0.07)', border: '1px solid rgba(34, 211, 238, 0.25)', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                        <strong style={{ color: '#67e8f9' }}>💡 Hướng dẫn chi tiết:</strong> Xem tài liệu <code style={{ color: '#fff' }}>HUONG_DAN_ANGULAR_APILOG.md</code> tại thư mục gốc của project để xem prompt copy gửi cho AI dev Angular và hướng dẫn chi tiết cho cả Angular NgModule cũ.
+                      </div>
+                    </div>
+                  )}
+
+                  {setupTab === 'axios' && (
+                    <div className="setup-pane">
+                      <div className="pane-heading">
+                        <h3>5. Tích hợp Axios Interceptor (Web App / React / Vue)</h3>
+                        <p>Gắn vào instance Axios một lần duy nhất khi ứng dụng khởi chạy:</p>
+                      </div>
+                      <CodeBlock
+                        label="Axios Monitor Setup"
+                        value={webAxiosSnippet}
+                        copyKey="axios"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+                    </div>
+                  )}
+
+                  {setupTab === 'fetch' && (
+                    <div className="setup-pane">
+                      <div className="pane-heading">
+                        <h3>6. Tích hợp Monitored Fetch (Web Vanilla / Next.js)</h3>
+                        <p>Sử dụng wrapper fetch để tự động đo latency và gửi telemetry:</p>
+                      </div>
+                      <CodeBlock
+                        label="Monitored Fetch"
+                        value={webFetchSnippet}
+                        copyKey="fetch"
+                        copiedItem={copiedItem}
+                        onCopy={copyToClipboard}
+                      />
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="modal-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.85rem 1.25rem', borderTop: '1px solid var(--line)', background: 'var(--surface-muted)' }}>
+              <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+                💡 Tip: Sao chép đoạn code tương ứng và dán trực tiếp vào dự án của bạn
+              </span>
+              <div style={{ display: 'flex', gap: '0.65rem' }}>
+                <button
+                  type="button"
+                  className="secondary-btn"
+                  onClick={() => copyToClipboard(API_MONITOR_URL, 'url')}
+                >
+                  {copiedItem === 'url' ? '✓ Đã sao chép' : '📋 Copy URL Server'}
+                </button>
+                <button
+                  type="button"
+                  className="primary-btn"
+                  onClick={() => setIntegrationOpen(false)}
+                >
+                  Đóng dialog
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODE 1: LOGS PANEL */}
+      {telemetryMode === 'logs' && (
+        <section className="log-panel" aria-labelledby="telemetry-log-title">
+          <div className="log-panel-header">
+            <div className="log-title-group">
+              <h2 id="telemetry-log-title">Nhật ký API Telemetry</h2>
+              <span className="count-pill">{filteredLogs.length} yêu cầu</span>
+            </div>
+
+            <div className="log-controls">
+              <div className="filter-tabs" role="tablist" aria-label="Lọc trạng thái HTTP">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === 'all'}
+                  className={`filter-tab ${activeTab === 'all' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('all')}
+                >
+                  Tất cả <span className="tab-count">{totalCalls}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === '200'}
+                  className={`filter-tab tab-success ${activeTab === '200' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('200')}
+                >
+                  <span className="dot dot-success" /> 200 OK <span className="tab-count">{count200}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === '400'}
+                  className={`filter-tab tab-warning ${activeTab === '400' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('400')}
+                >
+                  <span className="dot dot-warning" /> 4xx Lỗi Client <span className="tab-count">{count400}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={activeTab === '500'}
+                  className={`filter-tab tab-danger ${activeTab === '500' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('500')}
+                >
+                  <span className="dot dot-danger" /> 5xx Lỗi Server <span className="tab-count">{count500}</span>
+                </button>
+              </div>
+
+              <CustomSelect
+                className="select-mini"
+                value={deviceFilter}
+                onChange={handleDeviceChange}
+                options={[
+                  {
+                    value: 'all',
+                    label: platformScope === 'web'
+                      ? `🌐 Tất cả trình duyệt ${uniqueDevices.length > 0 ? `(${uniqueDevices.length})` : ''}`
+                      : `📱 Tất cả thiết bị ${uniqueDevices.length > 0 ? `(${uniqueDevices.length})` : ''}`,
+                  },
+                  ...uniqueDevices.map((d) => ({
+                    value: d,
+                    label: `${platformScope === 'web' ? '🌐' : '📱'} ${d}`,
+                  })),
+                ]}
+                ariaLabel={platformScope === 'web' ? 'Lọc theo trình duyệt' : 'Lọc theo thiết bị'}
+              />
+
+              <CustomSelect
+                className="select-mini"
+                value={userFilter}
+                onChange={handleUserChange}
+                options={[
+                  {
+                    value: 'all',
+                    label: platformScope === 'web'
+                      ? `👤 Tất cả user web ${uniqueUsers.length > 0 ? `(${uniqueUsers.length})` : ''}`
+                      : `👤 Tất cả user ${uniqueUsers.length > 0 ? `(${uniqueUsers.length})` : ''}`,
+                  },
+                  ...uniqueUsers.map((u) => ({ value: u, label: `👤 ${u}` })),
+                ]}
+                ariaLabel={platformScope === 'web' ? 'Lọc theo người dùng web' : 'Lọc theo người dùng'}
+              />
+
+              <label className="search-field">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="6" />
+                  <path d="m16 16 4 4" />
+                </svg>
+                <span className="sr-only">Tìm kiếm logs</span>
+                <input
+                  type="search"
+                  placeholder="Tìm theo Tên, Thiết bị, IP máy, URL..."
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                />
+              </label>
+
+              <button
+                type="button"
+                className="secondary-btn"
+                style={{ padding: '0.45rem 0.8rem', fontSize: '0.8rem', whiteSpace: 'nowrap' }}
+                onClick={() => exportToCsv('logs', filteredLogs)}
+                title="Xuất danh sách API Logs đang xem ra file CSV"
+              >
+                📥 Xuất CSV
+              </button>
+            </div>
+          </div>
+
+          {error && (
+            <div className="error-banner" role="alert">
+              <span>Không thể kết nối lấy telemetry: {error}</span>
+              <button type="button" onClick={() => fetchAllTelemetry()}>Thử lại</button>
+            </div>
+          )}
+
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: '120px' }}>Thời gian</th>
+                  <th style={{ width: '22%' }}>Mục tiêu (Job / User)</th>
+                  <th style={{ width: '8%' }}>Method</th>
+                  <th>Endpoint</th>
+                  <th style={{ width: '80px' }}>Trạng thái</th>
+                  <th style={{ width: '22%' }}>Dữ liệu / Lỗi tóm tắt</th>
+                  <th style={{ width: '75px' }}>Độ trễ</th>
+                  <th style={{ width: '80px' }}><span className="sr-only">Thao tác</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && logs.length === 0 && (
+                  <tr><td colSpan="8" className="table-message">Đang kết nối nhận telemetry…</td></tr>
+                )}
+
+                {filteredLogs.length === 0 && !loading && (
+                  <tr>
+                    <td colSpan="8">
+                      <div className="empty-state">
+                        <h3>{logs.length === 0 ? 'Chưa có telemetry nào' : 'Không tìm thấy request phù hợp'}</h3>
+                        <p>
+                          {logs.length === 0
+                            ? 'Kết nối client Mobile hoặc Web để theo dõi các lệnh gọi API theo thời gian thực.'
+                            : 'Thử tìm kiếm với từ khóa khác hoặc xóa bộ lọc.'}
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+
+                {paginatedLogs.map((log) => {
+                  const statusMeta = getStatusMeta(log.status_code);
+                  const summaryText = getSummarySnippet(log);
+                  const isApp = log.job_type === 'app';
+
+                  return (
+                    <tr
+                      key={log.id}
+                      className={statusMeta.type !== '200' ? 'row-error' : ''}
+                      onClick={() => openDetail('log', log, setSelectedLog)}
+                      style={{ cursor: 'pointer' }}
+                      title="Nhấn để xem chi tiết"
+                    >
+                      <td className="timestamp-cell" style={{ whiteSpace: 'nowrap', fontSize: '0.78rem', lineHeight: 1.4 }}>
+                        <div>{formatVietnamDate(log.created_at)}</div>
+                        <div style={{ color: 'var(--text-dim)', fontWeight: 600 }}>{formatVietnamTime(log.created_at)}</div>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.28rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', flexWrap: 'wrap' }}>
+                            <span className={`type-badge ${isApp ? 'type-badge-app' : 'type-badge-web'}`} style={{ width: 'fit-content', fontSize: '0.72rem' }}>
+                              {isApp ? '📱' : '🌐'} {log.job_name || log.app_identifier || 'App'}
+                            </span>
+                            {log.user_name ? (
+                              <span
+                                className="user-tag"
+                                style={{ fontSize: '0.72rem', cursor: 'pointer', padding: '0.1rem 0.35rem' }}
+                                title="Nhấp để lọc theo người dùng này"
+                                onClick={(e) => { e.stopPropagation(); setSearchTerm(log.user_name); }}
+                              >
+                                👤 {log.user_name}
+                              </span>
+                            ) : null}
+                          </div>
+
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem', flexWrap: 'wrap', fontSize: '0.72rem', color: 'var(--text-dim)' }}>
+                            <span
+                              style={{ display: 'inline-flex', alignItems: 'center', gap: '0.2rem', cursor: 'pointer' }}
+                              title="Nhấp để lọc theo thiết bị"
+                              onClick={(e) => { e.stopPropagation(); setSearchTerm(log.device_name || ''); }}
+                            >
+                              <span>📱</span>
+                              <strong style={{ color: 'var(--text-muted)' }}>
+                                {log.device_name || (isApp ? 'Thiết bị di động' : 'Trình duyệt Web')}
+                              </strong>
+                            </span>
+
+                            {log.ip_address ? (
+                              <span
+                                style={{ display: 'inline-flex', alignItems: 'center', gap: '0.2rem', cursor: 'pointer', opacity: 0.85 }}
+                                title="Nhấp để lọc theo IP này"
+                                onClick={(e) => { e.stopPropagation(); setSearchTerm(log.ip_address); }}
+                              >
+                                <span>🌐</span>
+                                <code>{log.ip_address}</code>
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+                      </td>
+                      <td>
+                        <span className={`method-badge ${(log.method || '').toLowerCase()}`}>
+                          {log.method}
+                        </span>
+                      </td>
+                      <td style={{ fontSize: '0.78rem', color: 'var(--text-muted)', wordBreak: 'break-all', maxWidth: '240px' }}>
+                        {log.endpoint}
+                      </td>
+                      <td>
+                        <span className={`status-badge ${statusMeta.badgeClass}`}>
+                          {log.status_code || 0}
+                        </span>
+                      </td>
+                      <td className="summary-cell" title={summaryText} style={{ fontSize: '0.78rem' }}>
+                        <span className={`summary-pill ${statusMeta.pillClass}`}>
+                          {summaryText}
+                        </span>
+                      </td>
+                      <td className="duration-cell">{log.duration_ms || 0} ms</td>
+                      <td className="action-cell" style={{ display: 'flex', gap: '0.35rem', justifyContent: 'flex-end' }}>
+                        <button
+                          type="button"
+                          className="view-btn"
+                          style={{ fontSize: '0.72rem', padding: '0.25rem 0.45rem', background: 'rgba(125, 156, 255, 0.12)', color: 'var(--accent)' }}
+                          title="Xem toàn bộ hành trình của User / Thiết bị này"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            viewUserTimeline({
+                              user: log.user_name || '',
+                              device: log.device_name || '',
+                              app: log.app_identifier || '',
+                            });
+                          }}
+                        >
+                          🐾
+                        </button>
+                        <button
+                          type="button"
+                          className="view-btn"
+                          style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openDetail('log', log, setSelectedLog);
+                          }}
+                        >
+                          Chi tiết
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <PaginationDock
+            currentPage={logsPage}
+            totalItems={filteredLogs.length}
+            pageSize={logsPageSize}
+            onPageChange={setLogsPage}
+            onPageSizeChange={(newSize) => { setLogsPageSize(newSize); setLogsPage(1); }}
+          />
+        </section>
+      )}
+
+      {/* MODE 2: CRASHLYTICS PANEL */}
+      {telemetryMode === 'crashes' && (
+        <section className="log-panel" aria-labelledby="crashlytics-log-title">
+          <div className="log-panel-header">
+            <div className="log-title-group">
+              <h2 id="crashlytics-log-title">Nhật ký sự cố & Crashlytics</h2>
+              <span className="count-pill">{filteredCrashes.length} sự cố</span>
+            </div>
+
+            <div className="log-controls">
+              <div className="filter-tabs" role="tablist" aria-label="Lọc mức độ crash">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={crashTab === 'all'}
+                  className={`filter-tab ${crashTab === 'all' ? 'active' : ''}`}
+                  onClick={() => setCrashTab('all')}
+                >
+                  Tất cả <span className="tab-count">{totalCrashes}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={crashTab === 'fatal'}
+                  className={`filter-tab tab-danger ${crashTab === 'fatal' ? 'active' : ''}`}
+                  onClick={() => setCrashTab('fatal')}
+                >
+                  <span className="dot dot-danger" /> {platformScope === 'web' ? 'Fatal (Lỗi Runtime)' : 'Fatal (Sập App)'} <span className="tab-count">{fatalCrashes}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={crashTab === 'non-fatal'}
+                  className={`filter-tab tab-warning ${crashTab === 'non-fatal' ? 'active' : ''}`}
+                  onClick={() => setCrashTab('non-fatal')}
+                >
+                  <span className="dot dot-warning" /> {platformScope === 'web' ? 'Non-fatal (Cảnh báo)' : 'Non-fatal (Ngoại lệ)'} <span className="tab-count">{nonFatalCrashes}</span>
+                </button>
+              </div>
+
+              <CustomSelect
+                className="select-mini"
+                value={deviceFilter}
+                onChange={handleDeviceChange}
+                options={[
+                  {
+                    value: 'all',
+                    label: platformScope === 'web'
+                      ? `🌐 Tất cả trình duyệt ${uniqueDevices.length > 0 ? `(${uniqueDevices.length})` : ''}`
+                      : `📱 Tất cả thiết bị ${uniqueDevices.length > 0 ? `(${uniqueDevices.length})` : ''}`,
+                  },
+                  ...uniqueDevices.map((d) => ({
+                    value: d,
+                    label: `${platformScope === 'web' ? '🌐' : '📱'} ${d}`,
+                  })),
+                ]}
+                ariaLabel={platformScope === 'web' ? 'Lọc theo trình duyệt' : 'Lọc theo thiết bị'}
+              />
+
+              <CustomSelect
+                className="select-mini"
+                value={userFilter}
+                onChange={handleUserChange}
+                options={[
+                  {
+                    value: 'all',
+                    label: platformScope === 'web'
+                      ? `👤 Tất cả user web ${uniqueUsers.length > 0 ? `(${uniqueUsers.length})` : ''}`
+                      : `👤 Tất cả user ${uniqueUsers.length > 0 ? `(${uniqueUsers.length})` : ''}`,
+                  },
+                  ...uniqueUsers.map((u) => ({ value: u, label: `👤 ${u}` })),
+                ]}
+                ariaLabel={platformScope === 'web' ? 'Lọc theo người dùng web' : 'Lọc theo người dùng'}
+              />
+
+              <label className="search-field">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="6" />
+                  <path d="m16 16 4 4" />
+                </svg>
+                <span className="sr-only">Tìm kiếm crash</span>
+                <input
+                  type="search"
+                  placeholder="Tìm lỗi, stack trace, app ID..."
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                />
+              </label>
+
+              <button
+                type="button"
+                className="secondary-btn"
+                style={{ padding: '0.45rem 0.8rem', fontSize: '0.8rem', whiteSpace: 'nowrap' }}
+                onClick={() => exportToCsv('crashes', filteredCrashes)}
+                title="Xuất danh sách Crashes đang xem ra file CSV"
+              >
+                📥 Xuất CSV
+              </button>
+            </div>
+          </div>
+
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: '130px' }}>Thời gian</th>
+                  <th style={{ width: '22%' }}>Mục tiêu (Job / App ID)</th>
+                  <th style={{ width: '110px' }}>Mức độ</th>
+                  <th>Ngoại lệ & Tiêu đề lỗi</th>
+                  <th style={{ width: '180px' }}>Thiết bị / OS</th>
+                  <th style={{ width: '80px' }}><span className="sr-only">Thao tác</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && crashes.length === 0 && (
+                  <tr><td colSpan="6" className="table-message">Đang kết nối lấy dữ liệu crash…</td></tr>
+                )}
+
+                {filteredCrashes.length === 0 && !loading && (
+                  <tr>
+                    <td colSpan="6">
+                      <div className="empty-state">
+                        <h3>{crashes.length === 0 ? 'Tuyệt vời! Không có sự cố crash nào' : 'Không tìm thấy crash phù hợp'}</h3>
+                        <p>
+                          {crashes.length === 0
+                            ? 'Hệ thống ứng dụng hoạt động ổn định và chưa ghi nhận bất kỳ ngoại lệ nào.'
+                            : 'Thử tìm kiếm với từ khóa khác hoặc chuyển tab lọc.'}
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+
+                {paginatedCrashes.map((crash) => {
+                  const isFatal = Number(crash.is_fatal) === 1;
+                  const deviceInfoParsed = parseJsonSafe(crash.device_info);
+
+                  return (
+                    <tr
+                      key={crash.id}
+                      className={isFatal ? 'row-error' : ''}
+                      onClick={() => openDetail('crash', crash, setSelectedCrash)}
+                      style={{ cursor: 'pointer' }}
+                      title="Nhấn để xem chi tiết & Stack Trace"
+                    >
+                      <td className="timestamp-cell" style={{ whiteSpace: 'nowrap', fontSize: '0.78rem', lineHeight: 1.4 }}>
+                        <div>{formatVietnamDate(crash.created_at)}</div>
+                        <div style={{ color: 'var(--text-dim)', fontWeight: 600 }}>{formatVietnamTime(crash.created_at)}</div>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                          <span className="type-badge type-badge-app" style={{ width: 'fit-content', fontSize: '0.72rem' }}>
+                            📱 {crash.job_name || crash.app_identifier || 'Mobile App'}
+                          </span>
+                          <small style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>
+                            {crash.app_identifier ? `<code>${crash.app_identifier}</code>` : '-'}
+                          </small>
+                        </div>
+                      </td>
+                      <td>
+                        {isFatal ? (
+                          <span className="badge-fatal">💥 FATAL</span>
+                        ) : (
+                          <span className="badge-non-fatal">⚠️ Non-fatal</span>
+                        )}
+                      </td>
+                      <td style={{ fontSize: '0.82rem', fontWeight: 500, color: isFatal ? '#ff7785' : 'var(--text)', wordBreak: 'break-word', maxWidth: '340px' }}>
+                        {crash.error_message}
+                      </td>
+                      <td>
+                        {deviceInfoParsed && typeof deviceInfoParsed === 'object' ? (
+                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem' }}>
+                            {deviceInfoParsed.os && <span className="device-chip">{deviceInfoParsed.os}</span>}
+                            {deviceInfoParsed.model && <span className="device-chip">{deviceInfoParsed.model}</span>}
+                            {deviceInfoParsed.app && <span className="device-chip">{deviceInfoParsed.app}</span>}
+                          </div>
+                        ) : (
+                          <span className="device-chip">📱 Mobile</span>
+                        )}
+                      </td>
+                      <td className="action-cell" style={{ display: 'flex', gap: '0.35rem', justifyContent: 'flex-end' }}>
+                        <button
+                          type="button"
+                          className="view-btn"
+                          style={{ fontSize: '0.72rem', padding: '0.25rem 0.45rem', background: 'rgba(125, 156, 255, 0.12)', color: 'var(--accent)' }}
+                          title="Xem toàn bộ hành trình trước khi xảy ra sự cố này"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            viewUserTimeline({
+                              user: crash.user_name || '',
+                              device: (typeof deviceInfoParsed === 'object' ? deviceInfoParsed.model || deviceInfoParsed.device_name : '') || '',
+                              app: crash.app_identifier || '',
+                            });
+                          }}
+                        >
+                          🐾
+                        </button>
+                        <button
+                          type="button"
+                          className="view-btn"
+                          style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openDetail('crash', crash, setSelectedCrash);
+                          }}
+                        >
+                          Stack Trace
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <PaginationDock
+            currentPage={crashPage}
+            totalItems={filteredCrashes.length}
+            pageSize={crashPageSize}
+            onPageChange={setCrashPage}
+            onPageSizeChange={(newSize) => { setCrashPageSize(newSize); setCrashPage(1); }}
+          />
+        </section>
+      )}
+
+      {/* MODE 3: ANALYTICS PANEL */}
+      {telemetryMode === 'analytics' && (
+        <section className="log-panel" aria-labelledby="analytics-log-title">
+          <div className="log-panel-header">
+            <div className="log-title-group">
+              <h2 id="analytics-log-title">Nhật ký sự kiện Analytics & Luồng màn hình</h2>
+              <span className="count-pill">{filteredEvents.length} sự kiện</span>
+            </div>
+
+            <div className="log-controls">
+              <div className="filter-tabs" role="tablist" aria-label="Lọc loại sự kiện">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={eventTab === 'all'}
+                  className={`filter-tab ${eventTab === 'all' ? 'active' : ''}`}
+                  onClick={() => setEventTab('all')}
+                >
+                  Tất cả <span className="tab-count">{totalEvents}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={eventTab === 'custom'}
+                  className={`filter-tab tab-accent ${eventTab === 'custom' ? 'active' : ''}`}
+                  onClick={() => setEventTab('custom')}
+                >
+                  ⚡ Custom Events <span className="tab-count">{customEventCount}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={eventTab === 'screen_view'}
+                  className={`filter-tab tab-success ${eventTab === 'screen_view' ? 'active' : ''}`}
+                  onClick={() => setEventTab('screen_view')}
+                >
+                  {platformScope === 'web' ? '🌐 Route / Page Views' : '📱 Screen Views'} <span className="tab-count">{screenViewCount}</span>
+                </button>
+              </div>
+
+              <CustomSelect
+                className="select-mini"
+                value={deviceFilter}
+                onChange={handleDeviceChange}
+                options={[
+                  {
+                    value: 'all',
+                    label: platformScope === 'web'
+                      ? `🌐 Tất cả trình duyệt ${uniqueDevices.length > 0 ? `(${uniqueDevices.length})` : ''}`
+                      : `📱 Tất cả thiết bị ${uniqueDevices.length > 0 ? `(${uniqueDevices.length})` : ''}`,
+                  },
+                  ...uniqueDevices.map((d) => ({
+                    value: d,
+                    label: `${platformScope === 'web' ? '🌐' : '📱'} ${d}`,
+                  })),
+                ]}
+                ariaLabel={platformScope === 'web' ? 'Lọc theo trình duyệt' : 'Lọc theo thiết bị'}
+              />
+
+              <CustomSelect
+                className="select-mini"
+                value={userFilter}
+                onChange={handleUserChange}
+                options={[
+                  {
+                    value: 'all',
+                    label: platformScope === 'web'
+                      ? `👤 Tất cả user web ${uniqueUsers.length > 0 ? `(${uniqueUsers.length})` : ''}`
+                      : `👤 Tất cả user ${uniqueUsers.length > 0 ? `(${uniqueUsers.length})` : ''}`,
+                  },
+                  ...uniqueUsers.map((u) => ({ value: u, label: `👤 ${u}` })),
+                ]}
+                ariaLabel={platformScope === 'web' ? 'Lọc theo người dùng web' : 'Lọc theo người dùng'}
+              />
+
+              <label className="search-field">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="6" />
+                  <path d="m16 16 4 4" />
+                </svg>
+                <span className="sr-only">Tìm kiếm sự kiện</span>
+                <input
+                  type="search"
+                  placeholder="Tìm tên sự kiện, màn hình, user ID..."
+                  value={searchTerm}
+                  onChange={(event) => setSearchTerm(event.target.value)}
+                />
+              </label>
+
+              <button
+                type="button"
+                className="secondary-btn"
+                style={{ padding: '0.45rem 0.8rem', fontSize: '0.8rem', whiteSpace: 'nowrap' }}
+                onClick={() => exportToCsv('events', filteredEvents)}
+                title="Xuất danh sách Analytics Events đang xem ra file CSV"
+              >
+                📥 Xuất CSV
+              </button>
+            </div>
+          </div>
+
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th style={{ width: '130px' }}>Thời gian</th>
+                  <th style={{ width: '20%' }}>Mục tiêu (Job / App)</th>
+                  <th style={{ width: '20%' }}>Tên sự kiện (Event)</th>
+                  <th style={{ width: '16%' }}>Màn hình (Screen)</th>
+                  <th style={{ width: '14%' }}>Người dùng (User ID)</th>
+                  <th>Tham số (Parameters)</th>
+                  <th style={{ width: '80px' }}><span className="sr-only">Thao tác</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {loading && events.length === 0 && (
+                  <tr><td colSpan="7" className="table-message">Đang kết nối lấy dữ liệu Analytics…</td></tr>
+                )}
+
+                {filteredEvents.length === 0 && !loading && (
+                  <tr>
+                    <td colSpan="7">
+                      <div className="empty-state">
+                        <h3>{events.length === 0 ? 'Chưa có sự kiện Analytics nào' : 'Không tìm thấy sự kiện phù hợp'}</h3>
+                        <p>
+                          {events.length === 0
+                            ? 'Tích hợp AppTelemetry.logEvent() hoặc logScreenView() trong Flutter để ghi nhận hành vi người dùng.'
+                            : 'Thử tìm kiếm với từ khóa khác hoặc chuyển tab lọc.'}
+                        </p>
+                      </div>
+                    </td>
+                  </tr>
+                )}
+
+                {paginatedEvents.map((event) => {
+                  const isScreen = event.event_type === 'screen_view' || event.event_name === 'screen_view';
+                  const paramsParsed = parseJsonSafe(event.parameters);
+
+                  return (
+                    <tr
+                      key={event.id}
+                      onClick={() => openDetail('event', event, setSelectedEvent)}
+                      style={{ cursor: 'pointer' }}
+                      title="Nhấn để xem chi tiết tham số"
+                    >
+                      <td className="timestamp-cell" style={{ whiteSpace: 'nowrap', fontSize: '0.78rem', lineHeight: 1.4 }}>
+                        <div>{formatVietnamDate(event.created_at)}</div>
+                        <div style={{ color: 'var(--text-dim)', fontWeight: 600 }}>{formatVietnamTime(event.created_at)}</div>
+                      </td>
+                      <td>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem' }}>
+                          <span className="type-badge" style={{ background: 'rgba(125, 156, 255, 0.12)', color: 'var(--accent)', width: 'fit-content', fontSize: '0.72rem' }}>
+                            {event.job_name || event.app_identifier || 'App/Web'}
+                          </span>
+                          <small style={{ color: 'var(--text-dim)', fontSize: '0.72rem' }}>
+                            <code>{event.app_identifier}</code>
+                          </small>
+                        </div>
+                      </td>
+                      <td>
+                        {isScreen ? (
+                          <span className="badge-screen-view">
+                            📱 screen_view
+                          </span>
+                        ) : (
+                          <span className="badge-event-name">
+                            ⚡ {event.event_name}
+                          </span>
+                        )}
+                      </td>
+                      <td style={{ fontSize: '0.82rem', color: event.screen_name ? 'var(--text)' : 'var(--text-dim)' }}>
+                        {event.screen_name ? <b>{event.screen_name}</b> : '—'}
+                      </td>
+                      <td>
+                        {event.user_id ? (
+                          <span className="user-tag">👤 {event.user_id}</span>
+                        ) : (
+                          <span style={{ color: 'var(--text-dim)', fontSize: '0.78rem' }}>Ẩn danh</span>
+                        )}
+                      </td>
+                      <td>
+                        {paramsParsed && typeof paramsParsed === 'object' ? (
+                          <div className="key-value-pill-list">
+                            {Object.entries(paramsParsed).slice(0, 3).map(([k, v]) => (
+                              <span key={k} className="key-value-chip">
+                                <span>{k}:</span> <strong>{String(v)}</strong>
+                              </span>
+                            ))}
+                            {Object.keys(paramsParsed).length > 3 && (
+                              <span className="key-value-chip">+ {Object.keys(paramsParsed).length - 3} nữa</span>
+                            )}
+                          </div>
+                        ) : (
+                          <span style={{ color: 'var(--text-dim)', fontSize: '0.78rem' }}>Không có params</span>
+                        )}
+                      </td>
+                      <td className="action-cell" style={{ display: 'flex', gap: '0.35rem', justifyContent: 'flex-end' }}>
+                        <button
+                          type="button"
+                          className="view-btn"
+                          style={{ fontSize: '0.72rem', padding: '0.25rem 0.45rem', background: 'rgba(125, 156, 255, 0.12)', color: 'var(--accent)' }}
+                          title="Xem toàn bộ hành trình của người dùng này"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            viewUserTimeline({
+                              user: event.user_name || event.user_id || '',
+                              device: event.device_name || '',
+                              app: event.app_identifier || '',
+                            });
+                          }}
+                        >
+                          🐾
+                        </button>
+                        <button
+                          type="button"
+                          className="view-btn"
+                          style={{ fontSize: '0.75rem', padding: '0.3rem 0.6rem' }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openDetail('event', event, setSelectedEvent);
+                          }}
+                        >
+                          Chi tiết
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <PaginationDock
+            currentPage={eventPage}
+            totalItems={filteredEvents.length}
+            pageSize={eventPageSize}
+            onPageChange={setEventPage}
+            onPageSizeChange={(newSize) => { setEventPageSize(newSize); setEventPage(1); }}
+          />
+        </section>
+      )}
+
+      {telemetryMode === 'funnels' && (
+        <section className="log-panel" aria-labelledby="funnel-stats-title">
+          <div className="log-panel-header">
+            <div className="log-title-group">
+              <h2 id="funnel-stats-title">
+                {funnelStats?.funnel?.name || 'Thống kê sự kiện'}
+              </h2>
+              <span className="count-pill">
+                {statsLoading ? 'Đang tính…' : `${funnelStats?.totals?.attempts ?? 0} lượt thử`}
+              </span>
+            </div>
+
+            <div className="log-controls">
+              <CustomSelect
+                className="select-mini"
+                value={activeFunnel}
+                onChange={(val) => setActiveFunnel(val)}
+                options={funnels.map((item) => ({
+                  value: item.funnel_key,
+                  label: `${item.status === 'inactive' ? '⏸ ' : ''}${item.name}`,
+                }))}
+                ariaLabel="Chọn luồng sự kiện cần thống kê"
+                placeholder="Chưa có luồng nào…"
+              />
+              <CustomSelect
+                className="select-mini"
+                value={statsRange}
+                onChange={(val) => setStatsRange(Number(val))}
+                options={RANGE_OPTIONS}
+                ariaLabel="Khoảng thời gian thống kê"
+              />
+              <button type="button" className="view-btn" onClick={() => openFunnelSetup()}>
+                ＋ Thêm luồng
+              </button>
+              {activeFunnel && (
+                <button
+                  type="button"
+                  className="view-btn"
+                  onClick={() => openFunnelSetup(activeFunnel)}
+                  title="Sửa cấu hình luồng đang chọn"
+                >
+                  ⚙️ Cấu hình
+                </button>
+              )}
+            </div>
+          </div>
+
+          {statsError && (
+            <div className="funnel-alert" role="alert">
+              ⚠️ {statsError}
+            </div>
+          )}
+
+          {!statsError && !funnelStats && !statsLoading && (
+            <div className="empty-state" style={{ padding: '2.5rem 1.25rem' }}>
+              <h3>Chưa có luồng sự kiện nào để thống kê</h3>
+              <p>
+                Bấm “Thêm luồng”, nhập tiền tố sự kiện (ví dụ <code>ekyb_</code>) và hệ thống sẽ
+                tự dò các sự kiện bắt đầu / thành công / thất bại tương ứng.
+              </p>
+            </div>
+          )}
+
+          {funnelStats && funnelStats.totals.attempts === 0 && (
+            <div className="empty-state" style={{ padding: '2.5rem 1.25rem' }}>
+              <h3>Không có lượt thử nào trong khoảng đã chọn</h3>
+              <p>
+                Đã quét {funnelStats.totals.events} sự kiện thuộc luồng này từ{' '}
+                {funnelStats.range.day_from} đến {funnelStats.range.day_to}. Thử mở rộng khoảng
+                thời gian, hoặc kiểm tra lại tên sự kiện tương quan trong phần Cấu hình.
+              </p>
+            </div>
+          )}
+
+          {funnelStats && funnelStats.totals.attempts > 0 && (
+            <div className="funnel-body">
+              {/* Phân bố kết quả cuối cùng */}
+              <div className="funnel-block">
+                <div className="funnel-block-head">
+                  <h3>Kết quả cuối cùng</h3>
+                  <span>
+                    {funnelStats.totals.completed}/{funnelStats.totals.attempts} lượt đã kết thúc
+                  </span>
+                </div>
+
+                <div className="outcome-bar" role="img" aria-label="Phân bố kết quả">
+                  {funnelStats.outcomes
+                    .filter((item) => item.count > 0)
+                    .map((item) => (
+                      <div
+                        key={item.key}
+                        className="outcome-bar-slice"
+                        style={{
+                          width: `${item.pct_of_attempts}%`,
+                          backgroundColor: OUTCOME_COLORS[item.key] || 'var(--line-strong)',
+                        }}
+                        title={`${item.label}: ${item.count} (${item.pct_of_attempts}%)`}
+                      />
+                    ))}
+                </div>
+
+                <ul className="outcome-legend">
+                  {funnelStats.outcomes
+                    .filter((item) => item.count > 0 || item.key !== 'other')
+                    .map((item) => (
+                      <li key={item.key}>
+                        <span
+                          className="legend-dot"
+                          style={{ backgroundColor: OUTCOME_COLORS[item.key] || 'var(--line-strong)' }}
+                        />
+                        <span className="legend-label">{item.label}</span>
+                        <strong>{item.count}</strong>
+                        <small>
+                          {item.pct_of_attempts}% lượt thử
+                          {item.pct_of_completed !== null && item.pct_of_completed !== undefined
+                            ? ` · ${item.pct_of_completed}% lượt đã kết thúc`
+                            : ''}
+                        </small>
+                      </li>
+                    ))}
+                </ul>
+              </div>
+
+              {/* Phễu theo từng bước */}
+              <div className="funnel-block">
+                <div className="funnel-block-head">
+                  <h3>Phễu theo từng bước</h3>
+                  <span>Tỷ lệ tính trên số lượt đã có kết quả ở bước đó</span>
+                </div>
+
+                <div className="step-list">
+                  {funnelStats.steps.map((step) => {
+                    const resolved = step.succeeded + step.failed;
+                    const widthBase = Math.max(1, funnelStats.steps[0]?.started || step.started || 1);
+                    return (
+                      <div className="step-row" key={step.step}>
+                        <div className="step-name">
+                          <strong>{step.label}</strong>
+                          <code>{step.step}</code>
+                        </div>
+                        <div className="step-bar-wrap">
+                          <div
+                            className="step-bar"
+                            style={{ width: `${Math.max(2, (step.started / widthBase) * 100)}%` }}
+                          >
+                            <div
+                              className="step-bar-ok"
+                              style={{ width: `${resolved ? (step.succeeded / resolved) * 100 : 0}%` }}
+                            />
+                            <div
+                              className="step-bar-fail"
+                              style={{ width: `${resolved ? (step.failed / resolved) * 100 : 0}%` }}
+                            />
+                          </div>
+                        </div>
+                        <div className="step-numbers">
+                          <span title="Số lượt bắt đầu bước này">▶ {step.started}</span>
+                          <span className="ok" title="Thành công">✓ {step.succeeded}</span>
+                          <span className={step.failed ? 'fail' : ''} title="Thất bại">
+                            ✕ {step.failed}
+                          </span>
+                          <span className="pctcell">{step.success_pct}%</span>
+                          <span className="latency" title={`${step.samples} mẫu đo`}>
+                            p50 {formatMs(step.p50_ms)} · p95 {formatMs(step.p95_ms)}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Nguyên nhân lỗi */}
+              {funnelStats.top_failures.length > 0 && (
+                <div className="funnel-block">
+                  <div className="funnel-block-head">
+                    <h3>Nguyên nhân thất bại hay gặp</h3>
+                    <span>% tính trên tổng số bước lỗi</span>
+                  </div>
+                  <div className="reason-table-wrap">
+                    <table className="reason-table">
+                      <thead>
+                        <tr>
+                          <th>Bước</th>
+                          <th>Lý do</th>
+                          <th>Mã lỗi</th>
+                          <th>HTTP</th>
+                          <th style={{ textAlign: 'right' }}>Số lần</th>
+                          <th style={{ textAlign: 'right' }}>Tỷ lệ</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {funnelStats.top_failures.map((row, index) => (
+                          <tr key={`${row.step}-${row.reason}-${row.error_code}-${index}`}>
+                            <td>{row.label || '—'}</td>
+                            <td><code>{row.reason || '—'}</code></td>
+                            <td>{row.error_code || '—'}</td>
+                            <td>{row.status_code || '—'}</td>
+                            <td style={{ textAlign: 'right', fontWeight: 700 }}>{row.count}</td>
+                            <td style={{ textAlign: 'right', color: 'var(--danger)' }}>{row.pct}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Lý do chuyển duyệt tay */}
+              {funnelStats.manual_fallbacks.length > 0 && (
+                <div className="funnel-block">
+                  <div className="funnel-block-head">
+                    <h3>Lý do bị chuyển sang duyệt tay</h3>
+                    <span>Số liệu cho SLA xử lý hồ sơ thủ công</span>
+                  </div>
+                  <ul className="fallback-list">
+                    {funnelStats.manual_fallbacks.map((row, index) => (
+                      <li key={`${row.step}-${row.reason}-${index}`}>
+                        <span className="fallback-step">{row.label || '—'}</span>
+                        <code>{row.reason || 'không ghi lý do'}</code>
+                        <strong>{row.count}</strong>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Diễn biến theo ngày */}
+              {funnelStats.series.length > 0 && (
+                <div className="funnel-block">
+                  <div className="funnel-block-head">
+                    <h3>Diễn biến theo ngày</h3>
+                    <span>
+                      Giờ Việt Nam
+                      {funnelStats.history_days
+                        ? ` · ${funnelStats.history_days} ngày lấy từ bảng tổng hợp`
+                        : ''}
+                    </span>
+                  </div>
+                  <div className="series-chart">
+                    {funnelStats.series.map((point) => {
+                      const peak = Math.max(...funnelStats.series.map((p) => p.attempts), 1);
+                      return (
+                        <div className="series-col" key={point.bucket}>
+                          <div
+                            className="series-stack"
+                            style={{ height: `${Math.max(4, (point.attempts / peak) * 100)}%` }}
+                            title={`${point.bucket}: ${point.attempts} lượt thử`}
+                          >
+                            {['success_auto', 'success_manual', 'failed', 'abandoned', 'open'].map(
+                              (key) =>
+                                point[key] > 0 ? (
+                                  <div
+                                    key={key}
+                                    style={{
+                                      height: `${(point[key] / point.attempts) * 100}%`,
+                                      backgroundColor: OUTCOME_COLORS[key],
+                                    }}
+                                  />
+                                ) : null
+                            )}
+                          </div>
+                          <span className="series-value">{point.attempts}</span>
+                          <span className="series-label">{point.bucket.slice(5)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* 5. User Journey Timeline Panel */}
+      {telemetryMode === 'timeline' && (
+        <section className="log-panel" style={{ background: 'none', border: 'none', padding: 0 }}>
+          <UserJourneyTimeline
+            initialUser={timelineUser}
+            initialDevice={timelineDevice}
+            initialApp={timelineApp || (selectedFilter !== 'all' ? selectedFilter : '')}
+            availableUsers={uniqueUsers}
+            availableDevices={uniqueDevices}
+            onOpenDetail={openDetail}
+          />
+        </section>
+      )}
+
+      {/* 6. Issues APM Management Panel */}
+      {telemetryMode === 'issues' && (
+        <IssueManagementPanel
+          selectedApp={selectedFilter !== 'all' ? selectedFilter : ''}
+          activeUserJob={activeUserJob}
+          onViewUserTimeline={viewUserTimeline}
+        />
+      )}
+
+
+      {/* MODAL: DETAIL FOR API LOG */}
+      {selectedLog && (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onClick={() => setSelectedLog(null)}
+        >
+          <div
+            className="modal-box"
+            style={{ maxWidth: '720px' }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="log-detail-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="modal-header-info">
+                <span>Chi tiết lệnh gọi API</span>
+                <h2 id="log-detail-title" title={selectedLog.endpoint}>
+                  {selectedLog.endpoint}
+                </h2>
+              </div>
+              <div className="modal-header-actions">
+                <button
+                  type="button"
+                  className="btn-mini"
+                  onClick={() => copyToClipboard(generateCurlCommand(selectedLog), 'curl')}
+                >
+                  {copiedItem === 'curl' ? '✓ Đã sao chép' : '📋 Copy cURL'}
+                </button>
+                <button
+                  type="button"
+                  className="close-btn"
+                  aria-label="Đóng chi tiết"
+                  onClick={() => setSelectedLog(null)}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-body">
+              {/* Target App/Web Information */}
+              <div style={{ background: 'var(--surface-muted)', border: '1px solid var(--line)', padding: '0.9rem 1.1rem', borderRadius: 'var(--radius-sm)', marginBottom: '1.2rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
+                <div>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    Mục tiêu theo dõi (Job)
+                  </span>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.2rem' }}>
+                    <span className={`type-badge ${selectedLog.job_type === 'app' ? 'type-badge-app' : 'type-badge-web'}`}>
+                      {selectedLog.job_type === 'app' ? '📱 App' : '🌐 Web'}
+                    </span>
+                    <strong style={{ fontSize: '0.92rem' }}>
+                      {selectedLog.job_name || 'Chưa phân loại'}
+                    </strong>
+                  </div>
+                </div>
+
+                <div style={{ textAlign: 'right' }}>
+                  <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                    Thiết bị & Người dùng
+                  </span>
+                  <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginTop: '0.2rem', display: 'flex', flexDirection: 'column', gap: '0.2rem', alignItems: 'flex-end' }}>
+                    <div>
+                      <span>📱 {selectedLog.device_name || (selectedLog.job_type === 'web' ? 'Trình duyệt Web' : 'Thiết bị di động')}</span>{' '}
+                      {selectedLog.app_identifier ? `(<code>${selectedLog.app_identifier}</code>)` : ''}
+                    </div>
+                    <div style={{ fontSize: '0.78rem', color: 'var(--text-dim)' }}>
+                      {selectedLog.user_name ? <span>👤 {selectedLog.user_name} · </span> : ''}
+                      {selectedLog.ip_address ? <span>🌐 IP: <code>{selectedLog.ip_address}</code></span> : ''}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Status Alert Banner */}
+              {(() => {
+                const meta = getStatusMeta(selectedLog.status_code);
+                if (meta.type === '200') {
+                  return (
+                    <div className="modal-status-banner banner-success">
+                      <div>
+                        <strong>✅ HTTP {selectedLog.status_code} OK — Yêu cầu thành công</strong>
+                        <span>API phản hồi thành công và trả về dữ liệu đầy đủ.</span>
+                      </div>
+                    </div>
+                  );
+                }
+                if (meta.type === '400') {
+                  return (
+                    <div className="modal-status-banner banner-warning">
+                      <div>
+                        <strong>⚠️ HTTP {selectedLog.status_code} — Lỗi từ Client (Bad Request / Validation)</strong>
+                        <span>
+                          {selectedLog.error_message
+                            ? `Nguyên nhân lỗi: ${selectedLog.error_message}`
+                            : 'Yêu cầu không hợp lệ hoặc thiếu tham số bắt buộc.'}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                }
+                return (
+                  <div className="modal-status-banner banner-danger">
+                    <div>
+                      <strong>🚨 HTTP {selectedLog.status_code || 500} — Lỗi máy chủ (Server Error)</strong>
+                      <span>
+                        {selectedLog.error_message
+                          ? `Lỗi: ${selectedLog.error_message}`
+                          : 'Hệ thống máy chủ gặp sự cố không thể xử lý yêu cầu.'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Meta Grid */}
+              <div className="modal-meta-grid">
+                <div>
+                  <span className="meta-label">Phương thức</span>
+                  <strong className="meta-value">{selectedLog.method}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Trạng thái HTTP</span>
+                  <strong className="meta-value">{selectedLog.status_code || 'Không có'}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Độ trễ phản hồi</span>
+                  <strong className="meta-value">{selectedLog.duration_ms || 0} ms</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Địa chỉ IP máy</span>
+                  <strong className="meta-value">{selectedLog.ip_address || 'Không xác định'}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Người dùng (User)</span>
+                  <strong className="meta-value">{selectedLog.user_name || 'Khách / Ẩn danh'}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Thời điểm ghi nhận</span>
+                  <strong className="meta-value">{formatDate(selectedLog.created_at)}</strong>
+                </div>
+              </div>
+
+              {/* Response Payload */}
+              <section className="log-section">
+                <div className="section-head">
+                  <h3>📦 Dữ liệu phản hồi (Response Payload)</h3>
+                  {selectedLog.response_payload && (
+                    <button
+                      type="button"
+                      className="btn-mini"
+                      onClick={() => copyToClipboard(formatJsonPretty(selectedLog.response_payload), 'res')}
+                    >
+                      {copiedItem === 'res' ? '✓ Đã sao chép' : 'Sao chép JSON'}
+                    </button>
+                  )}
+                </div>
+                <pre className="log-code">
+                  {selectedLog.response_payload
+                    ? formatJsonPretty(selectedLog.response_payload)
+                    : '// Không có response payload trả về'}
+                </pre>
+              </section>
+
+              {/* Error Detail */}
+              {selectedLog.error_message && (
+                <section className="log-section">
+                  <div className="section-head">
+                    <h3 className="text-danger">⚠️ Chi tiết lỗi (Error Details)</h3>
+                    <button
+                      type="button"
+                      className="btn-mini"
+                      onClick={() => copyToClipboard(selectedLog.error_message, 'err')}
+                    >
+                      {copiedItem === 'err' ? '✓ Đã sao chép' : 'Sao chép'}
+                    </button>
+                  </div>
+                  <div className="log-code error-highlight">
+                    {selectedLog.error_message}
+                  </div>
+                </section>
+              )}
+
+              {/* Request Payload */}
+              {selectedLog.request_payload && (
+                <section className="log-section">
+                  <div className="section-head">
+                    <h3>📤 Dữ liệu gửi đi (Request Payload)</h3>
+                    <button
+                      type="button"
+                      className="btn-mini"
+                      onClick={() => copyToClipboard(formatJsonPretty(selectedLog.request_payload), 'req')}
+                    >
+                      {copiedItem === 'req' ? '✓ Đã sao chép' : 'Sao chép JSON'}
+                    </button>
+                  </div>
+                  <pre className="log-code">
+                    {formatJsonPretty(selectedLog.request_payload)}
+                  </pre>
+                </section>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: DETAIL FOR CRASH */}
+      {selectedCrash && (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onClick={() => setSelectedCrash(null)}
+        >
+          <div
+            className="modal-box"
+            style={{ maxWidth: '820px' }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="crash-detail-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="modal-header-info">
+                <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  {Number(selectedCrash.is_fatal) === 1 ? (
+                    <span className="badge-fatal">💥 FATAL CRASH (SẬP ỨNG DỤNG)</span>
+                  ) : (
+                    <span className="badge-non-fatal">⚠️ NON-FATAL EXCEPTION</span>
+                  )}
+                  <span>Mã sự cố #{selectedCrash.id}</span>
+                </span>
+                <h2 id="crash-detail-title" style={{ color: Number(selectedCrash.is_fatal) === 1 ? '#ff7785' : 'var(--text)' }}>
+                  {selectedCrash.error_message}
+                </h2>
+              </div>
+              <div className="modal-header-actions">
+                <button
+                  type="button"
+                  className="btn-mini"
+                  onClick={() => copyToClipboard(selectedCrash.stack_trace || selectedCrash.error_message, 'stack')}
+                >
+                  {copiedItem === 'stack' ? '✓ Đã sao chép' : '📋 Copy Stack Trace'}
+                </button>
+                <button
+                  type="button"
+                  className="close-btn"
+                  aria-label="Đóng chi tiết"
+                  onClick={() => setSelectedCrash(null)}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-body">
+              {/* Target & App info */}
+              <div className="modal-meta-grid" style={{ marginBottom: '1.2rem' }}>
+                <div>
+                  <span className="meta-label">Ứng dụng (App ID)</span>
+                  <strong className="meta-value"><code>{selectedCrash.app_identifier || 'Không rõ'}</code></strong>
+                </div>
+                <div>
+                  <span className="meta-label">Mục tiêu giám sát</span>
+                  <strong className="meta-value">{selectedCrash.job_name || 'Fizahub Mobile App'}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Mức độ nguy hiểm</span>
+                  <strong className="meta-value" style={{ color: Number(selectedCrash.is_fatal) === 1 ? '#ff7785' : '#f2c36d' }}>
+                    {Number(selectedCrash.is_fatal) === 1 ? 'Khẩn cấp (Crash Fatal)' : 'Cảnh báo (Non-Fatal)'}
+                  </strong>
+                </div>
+                <div>
+                  <span className="meta-label">Thời điểm xảy ra</span>
+                  <strong className="meta-value">{formatDate(selectedCrash.created_at)}</strong>
+                </div>
+              </div>
+
+              {/* Stack Trace Box */}
+              <section className="log-section">
+                <div className="section-head">
+                  <h3 style={{ color: '#ff7785' }}>📜 Stack Trace chi tiết (Dòng lệnh gây lỗi)</h3>
+                  {selectedCrash.stack_trace && (
+                    <button
+                      type="button"
+                      className="btn-mini"
+                      onClick={() => copyToClipboard(selectedCrash.stack_trace, 'raw_stack')}
+                    >
+                      {copiedItem === 'raw_stack' ? '✓ Đã chép' : 'Sao chép Trace'}
+                    </button>
+                  )}
+                </div>
+                <pre className="stack-trace-view">
+                  {selectedCrash.stack_trace || '// Không có stack trace được đính kèm'}
+                </pre>
+              </section>
+
+              {/* Device & Custom Attributes */}
+              {selectedCrash.device_info && (
+                <section className="log-section">
+                  <div className="section-head">
+                    <h3>📱 Thông tin thiết bị & Môi trường</h3>
+                  </div>
+                  <pre className="log-code">
+                    {formatJsonPretty(selectedCrash.device_info)}
+                  </pre>
+                </section>
+              )}
+
+              {selectedCrash.custom_attributes && (
+                <section className="log-section">
+                  <div className="section-head">
+                    <h3>🏷️ Thuộc tính tùy chỉnh (Custom Attributes)</h3>
+                  </div>
+                  <pre className="log-code">
+                    {formatJsonPretty(selectedCrash.custom_attributes)}
+                  </pre>
+                </section>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: DETAIL FOR ANALYTICS EVENT */}
+      {selectedEvent && (
+        <div
+          className="modal-overlay"
+          role="presentation"
+          onClick={() => setSelectedEvent(null)}
+        >
+          <div
+            className="modal-box"
+            style={{ maxWidth: '720px' }}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="event-detail-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-header">
+              <div className="modal-header-info">
+                <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                  {selectedEvent.event_type === 'screen_view' ? (
+                    <span className="badge-screen-view">📱 SCREEN VIEW</span>
+                  ) : (
+                    <span className="badge-event-name">⚡ CUSTOM EVENT</span>
+                  )}
+                  <span>Sự kiện #{selectedEvent.id}</span>
+                </span>
+                <h2 id="event-detail-title" style={{ color: 'var(--accent)' }}>
+                  {selectedEvent.event_name}
+                </h2>
+              </div>
+              <div className="modal-header-actions">
+                <button
+                  type="button"
+                  className="close-btn"
+                  aria-label="Đóng chi tiết"
+                  onClick={() => setSelectedEvent(null)}
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-body">
+              <div className="modal-meta-grid" style={{ marginBottom: '1.2rem' }}>
+                <div>
+                  <span className="meta-label">Màn hình ghi nhận</span>
+                  <strong className="meta-value">{selectedEvent.screen_name || 'Không xác định'}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Người dùng (User ID)</span>
+                  <strong className="meta-value">{selectedEvent.user_id || 'Khách (Anonymous)'}</strong>
+                </div>
+                <div>
+                  <span className="meta-label">Ứng dụng (App ID)</span>
+                  <strong className="meta-value"><code>{selectedEvent.app_identifier || 'Không rõ'}</code></strong>
+                </div>
+                <div>
+                  <span className="meta-label">Thời điểm ghi nhận</span>
+                  <strong className="meta-value">{formatDate(selectedEvent.created_at)}</strong>
+                </div>
+              </div>
+
+              {/* Parameters section */}
+              <section className="log-section">
+                <div className="section-head">
+                  <h3>📊 Tham số sự kiện (Event Parameters)</h3>
+                  {selectedEvent.parameters && (
+                    <button
+                      type="button"
+                      className="btn-mini"
+                      onClick={() => copyToClipboard(formatJsonPretty(selectedEvent.parameters), 'event_params')}
+                    >
+                      {copiedItem === 'event_params' ? '✓ Đã sao chép' : 'Sao chép JSON'}
+                    </button>
+                  )}
+                </div>
+                <pre className="log-code">
+                  {selectedEvent.parameters
+                    ? formatJsonPretty(selectedEvent.parameters)
+                    : '// Sự kiện không có tham số đính kèm'}
+                </pre>
+              </section>
+
+              {/* Device Info */}
+              {selectedEvent.device_info && (
+                <section className="log-section">
+                  <div className="section-head">
+                    <h3>📱 Thông tin thiết bị</h3>
+                  </div>
+                  <pre className="log-code">
+                    {formatJsonPretty(selectedEvent.device_info)}
+                  </pre>
+                </section>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Cấu hình luồng sự kiện cần thống kê */}
+      {funnelSetupOpen && (
+        <div
+          className="modal-overlay"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) setFunnelSetupOpen(false);
+          }}
+        >
+          <div className="modal-content" style={{ width: 'min(640px, 100%)' }}>
+            <div className="modal-header">
+              <div className="modal-header-info">
+                <span>Thống kê sự kiện</span>
+                <h2>{funnelDraft.isEdit ? 'Sửa luồng sự kiện' : 'Thêm luồng sự kiện mới'}</h2>
+              </div>
+              <div className="modal-header-actions">
+                <button type="button" className="close-btn" onClick={() => setFunnelSetupOpen(false)}>
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="modal-body funnel-setup">
+              <p className="funnel-setup-hint">
+                Chỉ cần tiền tố sự kiện. Hệ thống sẽ tự dò sự kiện bắt đầu, kết thúc, và các bước
+                thành công / thất bại từ dữ liệu có thật trong kho, rồi tính % giúp bạn.
+              </p>
+
+              <label className="funnel-field">
+                <span>Mã luồng (không dấu, không khoảng trắng)</span>
+                <input
+                  type="text"
+                  value={funnelDraft.funnel_key}
+                  disabled={funnelDraft.isEdit}
+                  placeholder="ekyb"
+                  onChange={(event) =>
+                    setFunnelDraft((draft) => ({ ...draft, funnel_key: event.target.value }))
+                  }
+                />
+              </label>
+
+              <label className="funnel-field">
+                <span>Tên hiển thị</span>
+                <input
+                  type="text"
+                  value={funnelDraft.name}
+                  placeholder="Định danh doanh nghiệp (eKYB)"
+                  onChange={(event) =>
+                    setFunnelDraft((draft) => ({ ...draft, name: event.target.value }))
+                  }
+                />
+              </label>
+
+              <label className="funnel-field">
+                <span>Tiền tố sự kiện</span>
+                <input
+                  type="text"
+                  value={funnelDraft.event_prefix}
+                  placeholder="ekyb_"
+                  onChange={(event) =>
+                    setFunnelDraft((draft) => ({ ...draft, event_prefix: event.target.value }))
+                  }
+                />
+              </label>
+
+              {eventCatalog.suggestions?.length > 0 && (
+                <div className="funnel-suggestions">
+                  <span>Tiền tố đang có dữ liệu:</span>
+                  <div>
+                    {eventCatalog.suggestions.map((item) => (
+                      <button
+                        key={item.prefix}
+                        type="button"
+                        className="chip-btn"
+                        onClick={() =>
+                          setFunnelDraft((draft) => ({
+                            ...draft,
+                            event_prefix: item.prefix,
+                            funnel_key: draft.funnel_key || item.prefix.replace(/_+$/, ''),
+                            name: draft.name || item.prefix.replace(/_+$/, ''),
+                          }))
+                        }
+                      >
+                        {item.prefix} <em>{item.events}</em>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {funnelDraft.event_prefix && eventCatalog.events?.length > 0 && (
+                <div className="funnel-preview">
+                  <span>Sự kiện sẽ được gom vào luồng này:</span>
+                  <div>
+                    {eventCatalog.events
+                      .filter((item) => item.event_name.startsWith(funnelDraft.event_prefix))
+                      .slice(0, 12)
+                      .map((item) => (
+                        <code key={item.event_name}>
+                          {item.event_name} <em>{item.total}</em>
+                        </code>
+                      ))}
+                    {eventCatalog.events.filter((item) =>
+                      item.event_name.startsWith(funnelDraft.event_prefix)
+                    ).length === 0 && (
+                      <span className="funnel-preview-empty">
+                        Chưa có sự kiện nào khớp tiền tố này trong kho dữ liệu.
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              {funnelDraft.isEdit && (
+                <button
+                  type="button"
+                  className="view-btn"
+                  style={{ color: 'var(--danger)', marginRight: 'auto' }}
+                  onClick={() => deleteFunnel(funnelDraft.funnel_key)}
+                >
+                  Xoá luồng
+                </button>
+              )}
+              <button type="button" className="secondary-btn" onClick={() => setFunnelSetupOpen(false)}>
+                Huỷ
+              </button>
+              <button
+                type="button"
+                className="primary-btn"
+                disabled={savingFunnel || !funnelDraft.funnel_key.trim() || !funnelDraft.name.trim()}
+                onClick={saveFunnel}
+              >
+                {savingFunnel ? 'Đang lưu…' : 'Lưu & xem thống kê'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: TELEGRAM ALERT SETTINGS */}
+      <TelegramSettingsModal
+        isOpen={telegramModalOpen}
+        onClose={() => setTelegramModalOpen(false)}
+      />
+
+    </div>
+  );
+}
+
+export default Dashboard;
