@@ -8,7 +8,9 @@ import IssueManagementPanel from '../../components/dashboard/IssueManagementPane
 import { exportToCsv } from '../../utils/exportCsv';
 import { usePlatform } from '../../context/PlatformContext';
 
-const API_MONITOR_URL = import.meta.env.VITE_WORKER_URL || 'https://flow-api.hieupham101097.workers.dev';
+const API_MONITOR_URL =
+  import.meta.env.VITE_WORKER_URL ||
+  (typeof window !== 'undefined' ? window.location.origin : '');
 
 // Nhận diện dữ liệu thuộc Web hay Mobile App
 function isItemWeb(item) {
@@ -491,7 +493,11 @@ function Dashboard() {
         }
       } else {
         const errText = await response.text().catch(() => '');
-        if (errText.includes('daily row read limit') || errText.includes('exceeded D1') || errText.includes('D1_ERROR')) {
+        if (
+          errText.includes('daily row read limit') ||
+          errText.includes('exceeded D1') ||
+          (errText.includes('quota') && errText.includes('exceeded'))
+        ) {
           setQuotaExceeded(true);
         }
       }
@@ -581,7 +587,7 @@ function Dashboard() {
           if (
             text.includes('daily row read limit') ||
             text.includes('exceeded D1') ||
-            text.includes('D1_ERROR')
+            (text.includes('quota') && text.includes('exceeded'))
           ) {
             setQuotaExceeded(true);
           }
@@ -1535,7 +1541,7 @@ export const appConfig: ApplicationConfig = {
               Tài khoản Cloudflare D1 Free Tier đã chạm hạn mức đọc trong ngày (5.000.000 rows/ngày)
             </strong>
             <span style={{ color: 'var(--text-muted)' }}>
-              Đã tối ưu hoàn tất <strong>Composite Indexes</strong> và <strong>Edge Memory Cache</strong> cho database <code>flow-api</code> mới (giảm 99% tải đọc). 
+              Đã tối ưu hoàn tất <strong>Composite Indexes</strong> và <strong>Edge Memory Cache</strong> cho database D1 mới (giảm 99% tải đọc). 
               Hệ thống đã tự động tạm dừng polling để tránh gửi request thừa. Cloudflare sẽ tự động mở lại hạn mức vào <strong>00:00 UTC (07:00 sáng mai)</strong>, hoặc bạn có thể nâng cấp lên Cloudflare Workers Paid ($5/tháng) để dùng ngay lập tức với 25 tỷ rows/tháng.
             </span>
           </div>

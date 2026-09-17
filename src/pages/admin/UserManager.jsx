@@ -2,7 +2,9 @@ import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { usePlatform } from '../../context/PlatformContext';
 
-const API_BASE_URL = import.meta.env.VITE_WORKER_URL || 'https://flow-api.hieupham101097.workers.dev';
+const API_BASE_URL =
+  import.meta.env.VITE_WORKER_URL ||
+  (typeof window !== 'undefined' ? window.location.origin : '');
 
 function UserManager() {
   const navigate = useNavigate();

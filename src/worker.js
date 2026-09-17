@@ -1247,8 +1247,8 @@ const isD1QuotaExceeded = (err) => {
   const message = (err?.message || String(err || '')).toLowerCase();
   return (
     message.includes('daily row read limit') ||
-    message.includes('exceeded') ||
-    message.includes('quota')
+    message.includes('exceeded d1') ||
+    (message.includes('quota') && message.includes('exceeded'))
   );
 };
 
@@ -1582,24 +1582,8 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, '').replace(/^\/+/, '/');
 
-    // Chỉ kiểm tra schema khi GHI. Chạy trên cả lượt đọc nghĩa là mỗi request
-    // kéo theo hàng chục câu DDL, vừa chậm vừa tốn hạn mức.
-    // /funnels là ngoại lệ: bảng cấu hình chỉ được tạo ở đây, và endpoint này
-    // gọi rất thưa nên chi phí không đáng kể.
-    const isWrite = request.method !== 'GET' && request.method !== 'HEAD';
-    if (
-      (isWrite &&
-        (path.startsWith('/logs') ||
-          path.startsWith('/users') ||
-          path.startsWith('/jobs') ||
-          path.startsWith('/crashes') ||
-          path.startsWith('/events') ||
-          path.startsWith('/settings') ||
-          path.startsWith('/telemetry/batch'))) ||
-      path.startsWith('/funnels') ||
-      path.startsWith('/settings') ||
-      path.startsWith('/issues')
-    ) {
+    // Đảm bảo cấu trúc bảng và index tồn tại cho DB mới (chỉ chạy 1 lần duy nhất khi isolate khởi động)
+    if (!tablesInitialized) {
       await ensureSchema(env.DB);
     }
 
